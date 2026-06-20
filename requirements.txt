@@ -1,0 +1,2 @@
+langdetect>=1.0.9
+tqdm>=4.0
