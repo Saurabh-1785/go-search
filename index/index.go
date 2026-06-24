@@ -24,12 +24,17 @@ type TermEntry struct {
 // DocMeta stores metadata needed to display search results.
 // The inverted index only stores uint32 DocIDs in postings —
 // this table maps them back to human-readable info.
+//
+// ContentOffset and ContentLength point into contents.bin for raw text
+// retrieval (used for snippet generation). Content is NOT stored in memory.
 type DocMeta struct {
-	DocID      uint32 `json:"doc_id"`
-	ExternalID string `json:"external_id"` // original SHA-256 hash from the crawler
-	URL        string `json:"url"`
-	Title      string `json:"title"`
-	Length     int    `json:"length"` // document content length in tokens (for future TF-IDF normalization)
+	DocID         uint32 `json:"doc_id"`
+	ExternalID    string `json:"external_id"` // original SHA-256 hash from the crawler
+	URL           string `json:"url"`
+	Title         string `json:"title"`
+	Length        int    `json:"length"`         // document content length in tokens
+	ContentOffset int64  `json:"content_offset"` // byte offset into contents.bin
+	ContentLength int64  `json:"content_length"` // byte length of raw content in contents.bin
 }
 
 // IndexStats holds summary statistics about the index.
@@ -43,21 +48,26 @@ type IndexStats struct {
 //
 // Dictionary maps each stemmed token to its TermEntry (posting list + DF).
 // DocTable maps uint32 DocIDs back to document metadata.
+// ContentsBuf temporarily holds raw content during indexing — flushed to
+// contents.bin on SaveIndex, then cleared to free memory.
 //
 // All methods are thread-safe — multiple goroutines can call AddDocument
 // concurrently (e.g., from crawler workers via the document channel).
 type Index struct {
-	mu         sync.RWMutex
-	dictionary map[string]*TermEntry
-	docTable   []DocMeta
-	nextDocID  uint32
+	mu          sync.RWMutex
+	dictionary  map[string]*TermEntry
+	docTable    []DocMeta
+	contentsBuf []string // temporary buffer, flushed to disk on SaveIndex
+	nextDocID   uint32
+	contentDir  string // directory where contents.bin lives (set after save/load)
 }
 
 // NewIndex creates an empty Index ready for document insertion.
 func NewIndex() *Index {
 	return &Index{
-		dictionary: make(map[string]*TermEntry),
-		docTable:   make([]DocMeta, 0),
+		dictionary:  make(map[string]*TermEntry),
+		docTable:    make([]DocMeta, 0),
+		contentsBuf: make([]string, 0),
 	}
 }
 
@@ -90,7 +100,9 @@ func (idx *Index) AddDocument(externalID, url, title, content string) {
 	docID := idx.nextDocID
 	idx.nextDocID++
 
-	// Store document metadata
+	// Store document metadata.
+	// ContentOffset/ContentLength are set to 0 here — they'll be
+	// populated when SaveIndex writes contents.bin to disk.
 	idx.docTable = append(idx.docTable, DocMeta{
 		DocID:      docID,
 		ExternalID: externalID,
@@ -98,6 +110,9 @@ func (idx *Index) AddDocument(externalID, url, title, content string) {
 		Title:      title,
 		Length:     len(tokens),
 	})
+
+	// Buffer raw content for later flush to disk.
+	idx.contentsBuf = append(idx.contentsBuf, content)
 
 	// Append postings for each unique term
 	for term, freq := range termFreqs {
@@ -221,6 +236,65 @@ func (idx *Index) Dictionary() map[string]*TermEntry {
 // DocTable returns the raw doc table slice. Used by SaveIndex for persistence.
 func (idx *Index) DocTable() []DocMeta {
 	return idx.docTable
+}
+
+// SetDocTable replaces the doc table. Used after loading from disk
+// when content offsets need to be applied.
+func (idx *Index) SetDocTable(table []DocMeta) {
+	idx.docTable = table
+}
+
+// ContentsBuf returns the raw content buffer. Used by SaveIndex.
+func (idx *Index) ContentsBuf() []string {
+	return idx.contentsBuf
+}
+
+// ClearContentsBuf frees the content buffer after it's been flushed to disk.
+func (idx *Index) ClearContentsBuf() {
+	idx.contentsBuf = nil
+}
+
+// ContentDir returns the directory where contents.bin is stored.
+func (idx *Index) ContentDir() string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.contentDir
+}
+
+// SetContentDir sets the directory where contents.bin is stored.
+func (idx *Index) SetContentDir(dir string) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.contentDir = dir
+}
+
+// GetDocContent reads a document's raw content from the content buffer
+// (during build) or from contents.bin on disk (after save).
+// Returns empty string if content is not available.
+func (idx *Index) GetDocContent(docID uint32) string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	if int(docID) >= len(idx.docTable) {
+		return ""
+	}
+
+	// If content buffer still has data (pre-save), use it.
+	if idx.contentsBuf != nil && int(docID) < len(idx.contentsBuf) {
+		return idx.contentsBuf[docID]
+	}
+
+	// Otherwise, read from disk.
+	meta := idx.docTable[docID]
+	if idx.contentDir == "" || meta.ContentLength == 0 {
+		return ""
+	}
+
+	content, err := ReadDocContent(idx.contentDir, meta.ContentOffset, meta.ContentLength)
+	if err != nil {
+		return ""
+	}
+	return content
 }
 
 // RLock acquires a read lock on the index. Used by persistence layer.

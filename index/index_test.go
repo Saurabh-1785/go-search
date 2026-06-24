@@ -325,8 +325,8 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatalf("SaveIndex failed: %v", err)
 	}
 
-	// Verify all 3 files exist
-	for _, name := range []string{postingsFile, dictionaryFile, docsFile} {
+	// Verify all 4 files exist
+	for _, name := range []string{postingsFile, dictionaryFile, docsFile, contentsFile} {
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			t.Fatalf("expected file %s to exist", name)

@@ -15,6 +15,7 @@ const (
 	postingsFile   = "postings.bin"
 	dictionaryFile = "dictionary.json"
 	docsFile       = "docs.json"
+	contentsFile   = "contents.bin"
 )
 
 // --- Dictionary JSON structures ---
@@ -53,9 +54,10 @@ func SaveIndex(idx *Index, dir string) error {
 		return fmt.Errorf("create index dir: %w", err)
 	}
 
-	// Hold read lock for the entire save to get a consistent snapshot.
-	idx.RLock()
-	defer idx.RUnlock()
+	// Hold write lock for the entire save — we mutate docTable (content offsets),
+	// clear contentsBuf, and set contentDir.
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 
 	// --- 1. Write postings.bin ---
 	postingsPath := filepath.Join(dir, postingsFile)
@@ -124,7 +126,43 @@ func SaveIndex(idx *Index, dir string) error {
 		return fmt.Errorf("encode dictionary: %w", err)
 	}
 
-	// --- 3. Write docs.json ---
+	// --- 3. Write contents.bin and populate DocMeta offsets ---
+	contentsPath := filepath.Join(dir, contentsFile)
+	cf, err := os.Create(contentsPath)
+	if err != nil {
+		return fmt.Errorf("create contents file: %w", err)
+	}
+	defer cf.Close()
+
+	contentsBuf := idx.ContentsBuf()
+	var contentOffset int64
+
+	for i := range docTable {
+		var contentBytes []byte
+		if contentsBuf != nil && i < len(contentsBuf) {
+			contentBytes = []byte(contentsBuf[i])
+		}
+
+		// Write content length prefix (uint32, 4 bytes)
+		contentLen := uint32(len(contentBytes))
+		if err := binary.Write(cf, binary.BigEndian, contentLen); err != nil {
+			return fmt.Errorf("write content length: %w", err)
+		}
+
+		// Write raw content bytes
+		if len(contentBytes) > 0 {
+			if _, err := cf.Write(contentBytes); err != nil {
+				return fmt.Errorf("write content: %w", err)
+			}
+		}
+
+		// Record offset (pointing to start of length prefix) and content byte length
+		docTable[i].ContentOffset = contentOffset + 4 // skip the 4-byte length prefix
+		docTable[i].ContentLength = int64(contentLen)
+		contentOffset += 4 + int64(contentLen)
+	}
+
+	// --- 4. Write docs.json (after content offsets are populated) ---
 	docsPath := filepath.Join(dir, docsFile)
 	docsF, err := os.Create(docsPath)
 	if err != nil {
@@ -137,6 +175,11 @@ func SaveIndex(idx *Index, dir string) error {
 	if err := docsEnc.Encode(docTable); err != nil {
 		return fmt.Errorf("encode docs: %w", err)
 	}
+
+	// Update internal state (safe — we hold the write lock).
+	idx.docTable = docTable
+	idx.contentsBuf = nil
+	idx.contentDir = dir
 
 	return nil
 }
@@ -220,4 +263,31 @@ func ReadPostings(dir string, offset, length int64) ([]Posting, error) {
 	}
 
 	return postings, nil
+}
+
+// ReadDocContent reads a single document's raw content from contents.bin.
+// Uses the offset/length from DocMeta — O(1) seek, no full file scan.
+// Only called for top-K results that need snippets.
+func ReadDocContent(dir string, offset, length int64) (string, error) {
+	if length == 0 {
+		return "", nil
+	}
+
+	contentsPath := filepath.Join(dir, contentsFile)
+	f, err := os.Open(contentsPath)
+	if err != nil {
+		return "", fmt.Errorf("open contents file: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", fmt.Errorf("seek to offset %d: %w", offset, err)
+	}
+
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return "", fmt.Errorf("read content: %w", err)
+	}
+
+	return string(buf), nil
 }
