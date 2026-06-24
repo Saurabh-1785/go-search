@@ -68,7 +68,10 @@ func NewJobManager() *JobManager {
 //
 // The onDocument callback is called for every extracted document —
 // use this to pipe documents directly to your indexer.
-func (jm *JobManager) StartJob(req CrawlRequest, onDocument func(doc extractor.Document)) string {
+//
+// The onComplete callback is called after a successful crawl —
+// use this for post-crawl actions like saving the index to disk.
+func (jm *JobManager) StartJob(req CrawlRequest, onDocument func(doc extractor.Document), onComplete func()) string {
 	jobID := generateJobID()
 
 	job := &CrawlJob{
@@ -140,6 +143,11 @@ func (jm *JobManager) StartJob(req CrawlRequest, onDocument func(doc extractor.D
 			PagesFailed:      result.PagesFailed,
 			Duration:         result.Duration.Round(time.Millisecond).String(),
 			OutputPath:       result.OutputPath,
+		}
+
+		// Run post-crawl actions (e.g., save index to disk)
+		if onComplete != nil {
+			onComplete()
 		}
 	}()
 

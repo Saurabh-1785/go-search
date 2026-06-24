@@ -6,17 +6,19 @@ import (
 	"net/http"
 	"strings"
 
+	"search-engine/index"
+
 	"github.com/Saurabh-1785/gocrawl/extractor"
 )
 
 // registerCrawlRoutes sets up the crawl API endpoints on the given mux.
-func registerCrawlRoutes(mux *http.ServeMux, jm *JobManager) {
+func registerCrawlRoutes(mux *http.ServeMux, jm *JobManager, idx *index.Index) {
 	mux.HandleFunc("/crawl", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
-		handleStartCrawl(w, r, jm)
+		handleStartCrawl(w, r, jm, idx)
 	})
 
 	mux.HandleFunc("/crawl/status/", func(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +56,7 @@ func registerCrawlRoutes(mux *http.ServeMux, jm *JobManager) {
 //	  "job_id": "abc123def456",
 //	  "status": "running"
 //	}
-func handleStartCrawl(w http.ResponseWriter, r *http.Request, jm *JobManager) {
+func handleStartCrawl(w http.ResponseWriter, r *http.Request, jm *JobManager, idx *index.Index) {
 	var req CrawlRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -70,15 +72,28 @@ func handleStartCrawl(w http.ResponseWriter, r *http.Request, jm *JobManager) {
 		return
 	}
 
-	// OnDocument callback — for now, just log.
-	// In the future, this is where you'd plug in your indexer:
-	//   indexer.Add(doc)
+	// OnDocument callback — feeds each crawled document into the inverted index.
+	// The index's AddDocument is thread-safe, but the crawl pipeline already
+	// serializes calls through a single consumer goroutine (see crawl_job.go).
 	onDocument := func(doc extractor.Document) {
-		log.Printf("[CRAWL] Indexed document: %s — %s (%d bytes)",
-			doc.ID[:12], doc.Title, doc.ContentLength)
+		idx.AddDocument(doc.ID, doc.URL, doc.Title, doc.Content)
+		log.Printf("[INDEX] doc #%d: %s — %s (%d bytes)",
+			idx.Stats().DocCount, doc.ID[:12], doc.Title, doc.ContentLength)
 	}
 
-	jobID := jm.StartJob(req, onDocument)
+	// Save the index to disk when the crawl finishes.
+	onComplete := func() {
+		stats := idx.Stats()
+		log.Printf("[INDEX] Crawl complete. Saving index: %d terms, %d docs, %d postings",
+			stats.TermCount, stats.DocCount, stats.TotalPostings)
+		if err := index.SaveIndex(idx, "data/index"); err != nil {
+			log.Printf("[ERROR] Failed to save index: %v", err)
+		} else {
+			log.Printf("[INDEX] Index saved to data/index/")
+		}
+	}
+
+	jobID := jm.StartJob(req, onDocument, onComplete)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"job_id": jobID,
