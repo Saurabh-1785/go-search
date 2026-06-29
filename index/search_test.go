@@ -6,9 +6,125 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// ==================== TF-IDF Tests ====================
+// ==================== BM25 Tests ====================
+
+func TestBM25IDF(t *testing.T) {
+	tests := []struct {
+		name     string
+		docCount int
+		df       uint32
+		wantZero bool
+	}{
+		{"rare term", 10000, 2, false},
+		{"common term", 10000, 5000, false},
+		{"all docs", 10000, 10000, false}, // BM25 IDF never goes zero for df < N
+		{"zero df", 10000, 0, true},
+		{"zero docCount", 0, 5, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BM25IDF(tt.docCount, tt.df)
+			if tt.wantZero && got != 0 {
+				t.Errorf("BM25IDF(%d, %d) = %f, want 0", tt.docCount, tt.df, got)
+			}
+			if !tt.wantZero && got <= 0 {
+				t.Errorf("BM25IDF(%d, %d) = %f, want > 0", tt.docCount, tt.df, got)
+			}
+		})
+	}
+
+	// Rare term should have higher IDF than common term.
+	rare := BM25IDF(10000, 2)
+	common := BM25IDF(10000, 5000)
+	if rare <= common {
+		t.Errorf("BM25IDF(rare) = %f should be > BM25IDF(common) = %f", rare, common)
+	}
+}
+
+func TestBM25IDFNeverNegative(t *testing.T) {
+	// BM25 IDF with Robertson-Walker smoothing should never go negative,
+	// even when DF > N/2. This is the key improvement over vanilla IDF.
+	got := BM25IDF(100, 90) // term in 90% of docs
+	if got < 0 {
+		t.Errorf("BM25IDF(100, 90) = %f, should never be negative", got)
+	}
+
+	got = BM25IDF(100, 100) // term in every doc
+	if got < 0 {
+		t.Errorf("BM25IDF(100, 100) = %f, should never be negative", got)
+	}
+}
+
+func TestBM25Score(t *testing.T) {
+	params := DefaultBM25()
+
+	// Basic sanity: score should be positive for non-zero inputs.
+	score := params.Score(5, 10, 100, 100.0, 1000)
+	if score <= 0 {
+		t.Errorf("BM25 score should be positive, got %f", score)
+	}
+}
+
+func TestBM25TFSaturation(t *testing.T) {
+	params := DefaultBM25()
+
+	// BM25 key property: TF=10 should NOT be 10× the score of TF=1.
+	// (Unlike TF-IDF which scales linearly with TF.)
+	score1 := params.Score(1, 10, 100, 100.0, 1000)
+	score10 := params.Score(10, 10, 100, 100.0, 1000)
+
+	ratio := score10 / score1
+	if ratio >= 5 {
+		t.Errorf("BM25 TF saturation failed: TF=10 gives %f, TF=1 gives %f, ratio=%f (should be < 5)",
+			score10, score1, ratio)
+	}
+	t.Logf("TF saturation: score(TF=1)=%f, score(TF=10)=%f, ratio=%.2f", score1, score10, ratio)
+}
+
+func TestBM25LongDocPenalty(t *testing.T) {
+	params := DefaultBM25()
+
+	// Same TF, but doc 2× average length should score lower.
+	shortDoc := params.Score(5, 10, 50, 100.0, 1000)   // shorter than avg
+	longDoc := params.Score(5, 10, 200, 100.0, 1000)    // longer than avg
+
+	if shortDoc <= longDoc {
+		t.Errorf("short doc (%f) should score higher than long doc (%f)", shortDoc, longDoc)
+	}
+}
+
+func TestBM25ZeroInputs(t *testing.T) {
+	params := DefaultBM25()
+
+	if got := params.Score(0, 10, 100, 100.0, 1000); got != 0 {
+		t.Errorf("BM25 with tf=0 should be 0, got %f", got)
+	}
+	if got := params.Score(5, 0, 100, 100.0, 1000); got != 0 {
+		t.Errorf("BM25 with df=0 should be 0, got %f", got)
+	}
+	if got := params.Score(5, 10, 100, 0, 1000); got != 0 {
+		t.Errorf("BM25 with avgDocLen=0 should be 0, got %f", got)
+	}
+	if got := params.Score(5, 10, 100, 100.0, 0); got != 0 {
+		t.Errorf("BM25 with docCount=0 should be 0, got %f", got)
+	}
+}
+
+func TestDefaultBM25Params(t *testing.T) {
+	params := DefaultBM25()
+	if params.K1 != 1.2 {
+		t.Errorf("expected K1=1.2, got %f", params.K1)
+	}
+	if params.B != 0.75 {
+		t.Errorf("expected B=0.75, got %f", params.B)
+	}
+}
+
+// ==================== TF-IDF Tests (legacy, kept for reference) ====================
 
 func TestIDF(t *testing.T) {
 	tests := []struct {
@@ -76,7 +192,7 @@ func TestTFIDFZeroDenominators(t *testing.T) {
 	}
 }
 
-// ==================== Search Tests ====================
+// ==================== Search Tests (now using BM25) ====================
 
 // helper: build an index with test documents.
 func buildTestIndex() *Index {
@@ -413,5 +529,186 @@ func TestSearchWithSnippets(t *testing.T) {
 	// Top result should have a snippet.
 	if resp.Results[0].Snippet == "" {
 		t.Error("expected non-empty snippet for top result")
+	}
+}
+
+// ==================== Evaluation Metrics Tests ====================
+
+func TestPrecisionAtK(t *testing.T) {
+	idx := buildTestIndex()
+
+	judgments := []RelevanceJudgment{
+		{
+			Query:        "Go programming",
+			RelevantURLs: []string{"https://go.dev", "https://go.dev/concurrency"},
+		},
+	}
+
+	report := Evaluate(idx, judgments, 10, DefaultBM25())
+
+	if len(report.Results) != 1 {
+		t.Fatalf("expected 1 eval result, got %d", len(report.Results))
+	}
+
+	result := report.Results[0]
+
+	// Both go.dev and go.dev/concurrency should be found in top 10.
+	if result.Hits < 1 {
+		t.Errorf("expected at least 1 hit, got %d", result.Hits)
+	}
+
+	// Precision@10 = hits / 10
+	if result.PrecisionK < 0 || result.PrecisionK > 1 {
+		t.Errorf("precision@K should be in [0, 1], got %f", result.PrecisionK)
+	}
+}
+
+func TestRecall(t *testing.T) {
+	idx := buildTestIndex()
+
+	judgments := []RelevanceJudgment{
+		{
+			Query:        "Go",
+			RelevantURLs: []string{"https://go.dev", "https://go.dev/concurrency"},
+		},
+	}
+
+	report := Evaluate(idx, judgments, 10, DefaultBM25())
+	result := report.Results[0]
+
+	// Both relevant docs should be found.
+	if result.Recall < 0.5 {
+		t.Errorf("expected recall >= 0.5 (both Go docs should be found), got %f", result.Recall)
+	}
+}
+
+func TestEvaluateMultipleQueries(t *testing.T) {
+	idx := buildTestIndex()
+
+	judgments := []RelevanceJudgment{
+		{
+			Query:        "Go",
+			RelevantURLs: []string{"https://go.dev"},
+		},
+		{
+			Query:        "pasta",
+			RelevantURLs: []string{"https://example.com/cooking"},
+		},
+	}
+
+	report := Evaluate(idx, judgments, 10, DefaultBM25())
+
+	if report.QueriesRun != 2 {
+		t.Errorf("expected QueriesRun=2, got %d", report.QueriesRun)
+	}
+
+	// Mean precision and recall should be computed.
+	if report.MeanPrecision < 0 {
+		t.Errorf("mean precision should be >= 0, got %f", report.MeanPrecision)
+	}
+	if report.MeanRecall < 0 {
+		t.Errorf("mean recall should be >= 0, got %f", report.MeanRecall)
+	}
+
+	t.Logf("Mean Precision@10=%.3f, Mean Recall=%.3f", report.MeanPrecision, report.MeanRecall)
+}
+
+func TestEvaluateEmptyJudgments(t *testing.T) {
+	idx := buildTestIndex()
+
+	report := Evaluate(idx, []RelevanceJudgment{}, 10, DefaultBM25())
+
+	if report.QueriesRun != 0 {
+		t.Errorf("expected QueriesRun=0, got %d", report.QueriesRun)
+	}
+}
+
+func TestEvaluateNoRelevantFound(t *testing.T) {
+	idx := buildTestIndex()
+
+	judgments := []RelevanceJudgment{
+		{
+			Query:        "Go",
+			RelevantURLs: []string{"https://nonexistent.example.com"},
+		},
+	}
+
+	report := Evaluate(idx, judgments, 10, DefaultBM25())
+	result := report.Results[0]
+
+	if result.Hits != 0 {
+		t.Errorf("expected 0 hits for non-existent URL, got %d", result.Hits)
+	}
+	if result.PrecisionK != 0 {
+		t.Errorf("expected precision=0, got %f", result.PrecisionK)
+	}
+	if result.Recall != 0 {
+		t.Errorf("expected recall=0, got %f", result.Recall)
+	}
+}
+
+// ==================== Query Log Tests ====================
+
+func TestQueryLogRecordAndStats(t *testing.T) {
+	ql := NewQueryLog()
+
+	ql.Record("golang", 2*time.Millisecond, 5)
+	ql.Record("rust", 3*time.Millisecond, 3)
+	ql.Record("python", 1*time.Millisecond, 8)
+
+	stats := ql.Stats()
+
+	if stats.TotalQueries != 3 {
+		t.Errorf("expected TotalQueries=3, got %d", stats.TotalQueries)
+	}
+
+	// Average latency = (2+3+1)/3 = 2ms
+	if stats.AvgLatencyMs < 1 || stats.AvgLatencyMs > 3 {
+		t.Errorf("expected avg latency ~2ms, got %f", stats.AvgLatencyMs)
+	}
+
+	// QPS should be > 0
+	if stats.QPS <= 0 {
+		t.Errorf("expected QPS > 0, got %f", stats.QPS)
+	}
+
+	// Uptime should be > 0
+	if stats.UptimeSeconds <= 0 {
+		t.Errorf("expected UptimeSeconds > 0, got %f", stats.UptimeSeconds)
+	}
+
+	// Recent should have 3 entries.
+	if len(stats.Recent) != 3 {
+		t.Errorf("expected 3 recent entries, got %d", len(stats.Recent))
+	}
+}
+
+func TestQueryLogEmpty(t *testing.T) {
+	ql := NewQueryLog()
+	stats := ql.Stats()
+
+	if stats.TotalQueries != 0 {
+		t.Errorf("expected TotalQueries=0, got %d", stats.TotalQueries)
+	}
+	if stats.AvgLatencyMs != 0 {
+		t.Errorf("expected AvgLatencyMs=0, got %f", stats.AvgLatencyMs)
+	}
+}
+
+func TestQueryLogRollingWindow(t *testing.T) {
+	ql := NewQueryLog()
+
+	// Record 110 queries — rolling window should keep last 100.
+	for i := 0; i < 110; i++ {
+		ql.Record("query", 1*time.Millisecond, 1)
+	}
+
+	stats := ql.Stats()
+
+	if stats.TotalQueries != 110 {
+		t.Errorf("expected TotalQueries=110, got %d", stats.TotalQueries)
+	}
+	if len(stats.Recent) != 100 {
+		t.Errorf("expected 100 recent entries (rolling window), got %d", len(stats.Recent))
 	}
 }

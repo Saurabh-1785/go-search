@@ -24,7 +24,7 @@ type SearchResponse struct {
 	TimeTakenMs float64        `json:"time_taken_ms"`
 }
 
-// Search processes a query string against the index using TF-IDF scoring.
+// Search processes a query string against the index using BM25 scoring.
 //
 // Parameters:
 //   - query: raw user query string (will be tokenized through the same pipeline)
@@ -33,11 +33,12 @@ type SearchResponse struct {
 //
 // Flow:
 //  1. Tokenize the query through the same pipeline as documents
-//  2. Look up posting lists for each query term
-//  3. Accumulate TF-IDF scores per document (TAAT — Term-At-A-Time)
-//  4. Apply boolean filter (AND mode: only docs containing all terms)
-//  5. Sort by score descending, take top-K
-//  6. Generate snippets for top-K results only (lazy content read from disk)
+//  2. Compute average document length for BM25 normalization
+//  3. Look up posting lists for each query term
+//  4. Accumulate BM25 scores per document (TAAT — Term-At-A-Time)
+//  5. Apply boolean filter (AND mode: only docs containing all terms)
+//  6. Sort by score descending, take top-K
+//  7. Generate snippets for top-K results only (lazy content read from disk)
 func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 	start := time.Now()
 
@@ -61,6 +62,8 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		mode = "or"
 	}
 
+	params := DefaultBM25()
+
 	idx.mu.RLock()
 
 	docCount := len(idx.docTable)
@@ -70,8 +73,16 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		return response
 	}
 
+	// Compute average document length for BM25.
+	// O(N) scan over docTable — just summing integers, very fast.
+	var totalLen int64
+	for _, meta := range idx.docTable {
+		totalLen += int64(meta.Length)
+	}
+	avgDocLen := float64(totalLen) / float64(docCount)
+
 	// Score accumulation: TAAT (Term-At-A-Time).
-	// For each query term, iterate its posting list and add the TF-IDF
+	// For each query term, iterate its posting list and add the BM25
 	// contribution to each document's running score.
 	scores := make(map[uint32]float64)
 	termHits := make(map[uint32]int) // how many query terms each doc matched
@@ -88,7 +99,7 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 				docLen = idx.docTable[p.DocID].Length
 			}
 
-			scores[p.DocID] += TFIDF(p.TF, entry.DF, docLen, docCount)
+			scores[p.DocID] += params.Score(p.TF, entry.DF, docLen, avgDocLen, docCount)
 			termHits[p.DocID]++
 		}
 	}

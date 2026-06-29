@@ -21,6 +21,9 @@ func main() {
 	// Initialize inverted index (shared across all crawl jobs)
 	idx := index.NewIndex()
 
+	// Initialize query log for latency/QPS tracking
+	ql := index.NewQueryLog()
+
 	// Set up routes
 	mux := http.NewServeMux()
 
@@ -45,13 +48,13 @@ func main() {
 	registerCrawlRoutes(mux, jm, idx)
 
 	// Search API
-	registerSearchRoutes(mux, idx)
+	registerSearchRoutes(mux, idx, ql)
 
 	// Start server
 	addr := ":" + port
 	fmt.Println()
 	fmt.Println("  ╔═══════════════════════════════════╗")
-	fmt.Println("  ║         GoSearch API v2.0          ║")
+	fmt.Println("  ║         GoSearch API v3.0          ║")
 	fmt.Println("  ╚═══════════════════════════════════╝")
 	fmt.Println()
 	log.Printf("[INFO]  Server starting on %s", addr)
@@ -59,7 +62,9 @@ func main() {
 	log.Printf("[INFO]    POST /crawl              — start a crawl job")
 	log.Printf("[INFO]    GET  /crawl/status/:id   — check job status")
 	log.Printf("[INFO]    GET  /crawl/jobs          — list all jobs")
-	log.Printf("[INFO]    GET  /search?q=...&k=10   — TF-IDF ranked search")
+	log.Printf("[INFO]    GET  /search?q=...&k=10   — BM25 ranked search")
+	log.Printf("[INFO]    GET  /search/stats        — query latency & QPS")
+	log.Printf("[INFO]    POST /eval               — precision@K & recall")
 	log.Printf("[INFO]    GET  /index/stats         — index statistics")
 	log.Printf("[INFO]    GET  /health              — health check")
 
