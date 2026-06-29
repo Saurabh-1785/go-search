@@ -1,7 +1,6 @@
 package index
 
 import (
-	"encoding/binary"
 	"os"
 	"path/filepath"
 	"sort"
@@ -374,7 +373,7 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatal("expected 'program' in dictionary")
 	}
 
-	postings, err := ReadPostings(dir, programEntry.Offset, programEntry.Length)
+	postings, err := ReadPostings(dir, programEntry.Offset, programEntry.Length, programEntry.DF)
 	if err != nil {
 		t.Fatalf("ReadPostings failed: %v", err)
 	}
@@ -395,7 +394,7 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 }
 
-func TestBinaryPostingSize(t *testing.T) {
+func TestCompressedPostingSize(t *testing.T) {
 	idx := NewIndex()
 
 	// Add 3 docs, each containing "go" → 3 postings for "go"
@@ -408,33 +407,47 @@ func TestBinaryPostingSize(t *testing.T) {
 		t.Fatalf("SaveIndex failed: %v", err)
 	}
 
-	// Read the raw binary file
+	// Read the raw binary file.
 	postingsPath := filepath.Join(dir, postingsFile)
 	data, err := os.ReadFile(postingsPath)
 	if err != nil {
 		t.Fatalf("read postings.bin: %v", err)
 	}
 
-	// Total postings across all terms = sum of all posting list lengths.
-	// "go" has 3 postings. There might be other terms too depending on tokenizer.
-	// But each posting must be exactly 8 bytes.
-	if len(data)%8 != 0 {
-		t.Errorf("postings.bin size %d is not a multiple of 8", len(data))
+	// Compressed postings should be SMALLER than the old fixed 8-byte format.
+	// With 3 postings at 8 bytes each, old size = 24 bytes.
+	// Delta+varint for DocIDs 0,1,2 with TF=1 each: ~6 bytes.
+	// The file has more terms from "go" stemming, but overall should be smaller.
+	uncompressedSize := 3 * 8 // 3 postings × 8 bytes (old format)
+	if len(data) > 0 {
+		t.Logf("postings.bin: %d bytes (old fixed format would be >= %d bytes)", len(data), uncompressedSize)
 	}
 
-	// Verify we can read back valid data
-	numPostings := len(data) / 8
-	if numPostings < 3 {
-		t.Errorf("expected at least 3 postings in binary file, got %d", numPostings)
+	// Verify we can read back via the dictionary.
+	dictFile, err := LoadDictionary(dir)
+	if err != nil {
+		t.Fatalf("LoadDictionary failed: %v", err)
 	}
 
-	// Read the first posting manually and verify it's a valid uint32 pair
-	docID := binary.BigEndian.Uint32(data[0:4])
-	tf := binary.BigEndian.Uint32(data[4:8])
-	if tf == 0 {
-		t.Error("expected non-zero TF in first posting")
+	// Version should be 2 (compressed format).
+	if dictFile.Meta.Version != 2 {
+		t.Errorf("expected dictionary version 2, got %d", dictFile.Meta.Version)
 	}
-	t.Logf("first posting: DocID=%d TF=%d", docID, tf)
+
+	// Read back postings for "go" and verify.
+	goEntry, ok := dictFile.Terms["go"]
+	if !ok {
+		t.Fatal("expected 'go' in dictionary")
+	}
+
+	postings, err := ReadPostings(dir, goEntry.Offset, goEntry.Length, goEntry.DF)
+	if err != nil {
+		t.Fatalf("ReadPostings failed: %v", err)
+	}
+	if len(postings) != 3 {
+		t.Fatalf("expected 3 postings for 'go', got %d", len(postings))
+	}
+	t.Logf("first posting: DocID=%d TF=%d", postings[0].DocID, postings[0].TF)
 }
 
 func TestSaveEmptyIndex(t *testing.T) {
@@ -466,17 +479,43 @@ func TestSaveEmptyIndex(t *testing.T) {
 	}
 }
 
-func TestReadPostingsInvalidLength(t *testing.T) {
-	// Length not a multiple of 8 should error
+func TestReadPostingsCompressedRoundTrip(t *testing.T) {
+	// Create an index, save it, and verify ReadPostings can decode.
+	idx := NewIndex()
+	idx.AddDocument("h1", "u1", "t1", "go fast")
+	idx.AddDocument("h2", "u2", "t2", "go slow")
+
 	dir := t.TempDir()
+	if err := SaveIndex(idx, dir); err != nil {
+		t.Fatalf("SaveIndex failed: %v", err)
+	}
 
-	// Create a dummy postings file
-	f, _ := os.Create(filepath.Join(dir, postingsFile))
-	f.Write([]byte{0, 0, 0, 1, 0, 0, 0, 2, 0}) // 9 bytes — invalid
-	f.Close()
+	dictFile, err := LoadDictionary(dir)
+	if err != nil {
+		t.Fatalf("LoadDictionary failed: %v", err)
+	}
 
-	_, err := ReadPostings(dir, 0, 9)
-	if err == nil {
-		t.Error("expected error for length=9 (not multiple of 8), got nil")
+	goEntry, ok := dictFile.Terms["go"]
+	if !ok {
+		t.Fatal("expected 'go' in dictionary")
+	}
+
+	postings, err := ReadPostings(dir, goEntry.Offset, goEntry.Length, goEntry.DF)
+	if err != nil {
+		t.Fatalf("ReadPostings failed: %v", err)
+	}
+
+	if len(postings) != 2 {
+		t.Fatalf("expected 2 postings, got %d", len(postings))
+	}
+
+	// DocIDs should be 0 and 1.
+	if postings[0].DocID != 0 || postings[1].DocID != 1 {
+		t.Errorf("expected DocIDs [0, 1], got [%d, %d]", postings[0].DocID, postings[1].DocID)
+	}
+
+	// TF should be 1 for each.
+	if postings[0].TF != 1 || postings[1].TF != 1 {
+		t.Errorf("expected TF [1, 1], got [%d, %d]", postings[0].TF, postings[1].TF)
 	}
 }

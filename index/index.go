@@ -57,9 +57,10 @@ type Index struct {
 	mu          sync.RWMutex
 	dictionary  map[string]*TermEntry
 	docTable    []DocMeta
-	contentsBuf []string // temporary buffer, flushed to disk on SaveIndex
+	contentsBuf []string       // temporary buffer, flushed to disk on SaveIndex
 	nextDocID   uint32
-	contentDir  string // directory where contents.bin lives (set after save/load)
+	contentDir  string         // directory where contents.bin lives (set after save/load)
+	cache       *SearchCache   // LRU cache for scored results (invalidated on AddDocument)
 }
 
 // NewIndex creates an empty Index ready for document insertion.
@@ -68,6 +69,7 @@ func NewIndex() *Index {
 		dictionary:  make(map[string]*TermEntry),
 		docTable:    make([]DocMeta, 0),
 		contentsBuf: make([]string, 0),
+		cache:       NewSearchCache(128),
 	}
 }
 
@@ -128,6 +130,11 @@ func (idx *Index) AddDocument(externalID, url, title, content string) {
 			TF:    freq,
 		})
 		entry.DF++
+	}
+
+	// Invalidate search cache — new doc changes scoring results.
+	if idx.cache != nil {
+		idx.cache.Invalidate()
 	}
 }
 

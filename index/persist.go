@@ -43,10 +43,11 @@ type DictFile struct {
 
 // --- Save ---
 
-// SaveIndex persists the index to disk as three files:
-//   - postings.bin  — binary posting lists (8 bytes per posting, fixed-size)
+// SaveIndex persists the index to disk as four files:
+//   - postings.bin  — delta+varint compressed posting lists
 //   - dictionary.json — term → {offset, length, df} + metadata
 //   - docs.json — array of DocMeta for search result display
+//   - contents.bin — raw document content for snippet generation
 //
 // The directory is created if it doesn't exist.
 func SaveIndex(idx *Index, dir string) error {
@@ -85,15 +86,13 @@ func SaveIndex(idx *Index, dir string) error {
 		entry := dict[term]
 		startOffset := offset
 
-		for _, p := range entry.Postings {
-			// Each posting: DocID (uint32, 4 bytes) + TF (uint32, 4 bytes) = 8 bytes
-			if err := binary.Write(pf, binary.BigEndian, p.DocID); err != nil {
-				return fmt.Errorf("write posting docID: %w", err)
+		// Delta+varint encode the posting list.
+		compressed := EncodePostings(entry.Postings)
+		if len(compressed) > 0 {
+			if _, err := pf.Write(compressed); err != nil {
+				return fmt.Errorf("write compressed postings for %q: %w", term, err)
 			}
-			if err := binary.Write(pf, binary.BigEndian, p.TF); err != nil {
-				return fmt.Errorf("write posting TF: %w", err)
-			}
-			offset += 8
+			offset += int64(len(compressed))
 		}
 
 		dictTerms[term] = DictEntry{
@@ -108,7 +107,7 @@ func SaveIndex(idx *Index, dir string) error {
 		Meta: DictMeta{
 			DocCount:  len(docTable),
 			TermCount: len(dict),
-			Version:   1,
+			Version:   2,
 		},
 		Terms: dictTerms,
 	}
@@ -223,19 +222,17 @@ func LoadDocTable(dir string) ([]DocMeta, error) {
 	return docs, nil
 }
 
-// ReadPostings reads a specific term's posting list from postings.bin
+// ReadPostings reads a specific term's compressed posting list from postings.bin
 // using the offset and length from the dictionary.
+//
+// The posting list is delta+varint encoded. df is needed to know how many
+// postings to decode.
 //
 // This enables lazy loading — only read postings for terms that are
 // actually queried, instead of loading the entire postings file.
-func ReadPostings(dir string, offset, length int64) ([]Posting, error) {
+func ReadPostings(dir string, offset, length int64, df uint32) ([]Posting, error) {
 	if length == 0 {
 		return nil, nil
-	}
-
-	// Each posting is 8 bytes (4 DocID + 4 TF).
-	if length%8 != 0 {
-		return nil, fmt.Errorf("invalid postings block length %d (must be multiple of 8)", length)
 	}
 
 	postingsPath := filepath.Join(dir, postingsFile)
@@ -250,19 +247,14 @@ func ReadPostings(dir string, offset, length int64) ([]Posting, error) {
 		return nil, fmt.Errorf("seek to offset %d: %w", offset, err)
 	}
 
-	numPostings := int(length / 8)
-	postings := make([]Posting, numPostings)
-
-	for i := 0; i < numPostings; i++ {
-		if err := binary.Read(f, binary.BigEndian, &postings[i].DocID); err != nil {
-			return nil, fmt.Errorf("read posting %d docID: %w", i, err)
-		}
-		if err := binary.Read(f, binary.BigEndian, &postings[i].TF); err != nil {
-			return nil, fmt.Errorf("read posting %d TF: %w", i, err)
-		}
+	// Read the compressed block.
+	data := make([]byte, length)
+	if _, err := io.ReadFull(f, data); err != nil {
+		return nil, fmt.Errorf("read compressed postings: %w", err)
 	}
 
-	return postings, nil
+	// Decode delta+varint compressed postings.
+	return DecodePostings(data, int(df))
 }
 
 // ReadDocContent reads a single document's raw content from contents.bin.

@@ -3,6 +3,7 @@ package index
 import (
 	"search-engine/tokenizer"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,7 @@ type SearchResponse struct {
 	Results     []SearchResult `json:"results"`
 	TotalHits   int            `json:"total_hits"`
 	TimeTakenMs float64        `json:"time_taken_ms"`
+	CacheHit    bool           `json:"cache_hit"`
 }
 
 // Search processes a query string against the index using BM25 scoring.
@@ -33,12 +35,10 @@ type SearchResponse struct {
 //
 // Flow:
 //  1. Tokenize the query through the same pipeline as documents
-//  2. Compute average document length for BM25 normalization
-//  3. Look up posting lists for each query term
-//  4. Accumulate BM25 scores per document (TAAT — Term-At-A-Time)
-//  5. Apply boolean filter (AND mode: only docs containing all terms)
-//  6. Sort by score descending, take top-K
-//  7. Generate snippets for top-K results only (lazy content read from disk)
+//  2. Check cache for previously scored results
+//  3. On cache miss: score with BM25 (parallel for multi-term queries)
+//  4. Cache the scored doc list
+//  5. Generate snippets for top-K results only (lazy content read from disk)
 func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 	start := time.Now()
 
@@ -62,6 +62,37 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		mode = "or"
 	}
 
+	// --- Check cache ---
+	cacheKey := CacheKey(query, topK, mode)
+	if idx.cache != nil {
+		if docs, totalHits, ok := idx.cache.Get(cacheKey); ok {
+			response.CacheHit = true
+			response.TotalHits = totalHits
+			response.Results = idx.buildResults(docs, query)
+			response.TimeTakenMs = float64(time.Since(start).Microseconds()) / 1000.0
+			return response
+		}
+	}
+
+	// --- Cache miss: compute scores ---
+	ranked, totalHits := idx.scoreQuery(queryTerms, topK, mode)
+
+	// Cache the scored docs (not the full response).
+	if idx.cache != nil {
+		idx.cache.Put(cacheKey, ranked, totalHits)
+	}
+
+	response.TotalHits = totalHits
+	response.Results = idx.buildResults(ranked, query)
+	response.TimeTakenMs = float64(time.Since(start).Microseconds()) / 1000.0
+
+	return response
+}
+
+// scoreQuery runs BM25 scoring across all query terms.
+// For multi-term queries (≥2 terms), each term is scored in its own goroutine.
+// Returns the ranked top-K scored docs and total hit count.
+func (idx *Index) scoreQuery(queryTerms []string, topK int, mode string) ([]ScoredDoc, int) {
 	params := DefaultBM25()
 
 	idx.mu.RLock()
@@ -69,39 +100,26 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 	docCount := len(idx.docTable)
 	if docCount == 0 {
 		idx.mu.RUnlock()
-		response.TimeTakenMs = float64(time.Since(start).Microseconds()) / 1000.0
-		return response
+		return nil, 0
 	}
 
 	// Compute average document length for BM25.
-	// O(N) scan over docTable — just summing integers, very fast.
 	var totalLen int64
 	for _, meta := range idx.docTable {
 		totalLen += int64(meta.Length)
 	}
 	avgDocLen := float64(totalLen) / float64(docCount)
 
-	// Score accumulation: TAAT (Term-At-A-Time).
-	// For each query term, iterate its posting list and add the BM25
-	// contribution to each document's running score.
-	scores := make(map[uint32]float64)
-	termHits := make(map[uint32]int) // how many query terms each doc matched
+	// --- Scoring: sequential for 1 term, parallel for 2+ ---
+	var scores map[uint32]float64
+	var termHits map[uint32]int
 
-	for _, term := range queryTerms {
-		entry, exists := idx.dictionary[term]
-		if !exists {
-			continue
-		}
-
-		for _, p := range entry.Postings {
-			docLen := 0
-			if int(p.DocID) < len(idx.docTable) {
-				docLen = idx.docTable[p.DocID].Length
-			}
-
-			scores[p.DocID] += params.Score(p.TF, entry.DF, docLen, avgDocLen, docCount)
-			termHits[p.DocID]++
-		}
+	if len(queryTerms) == 1 {
+		// Single term: no goroutine overhead.
+		scores, termHits = idx.scoreTerm(queryTerms[0], params, avgDocLen, docCount)
+	} else {
+		// Multi-term: parallel scoring with per-goroutine maps.
+		scores, termHits = idx.scoreTermsParallel(queryTerms, params, avgDocLen, docCount)
 	}
 
 	idx.mu.RUnlock()
@@ -115,17 +133,12 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		}
 	}
 
-	// Convert scores map to a sortable slice.
-	type scoredDoc struct {
-		DocID uint32
-		Score float64
-	}
-	ranked := make([]scoredDoc, 0, len(scores))
+	// Convert to sorted slice.
+	ranked := make([]ScoredDoc, 0, len(scores))
 	for docID, score := range scores {
-		ranked = append(ranked, scoredDoc{DocID: docID, Score: score})
+		ranked = append(ranked, ScoredDoc{DocID: docID, Score: score})
 	}
 
-	// Sort by score descending.
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].Score == ranked[j].Score {
 			return ranked[i].DocID < ranked[j].DocID // tie-break by DocID
@@ -133,20 +146,105 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		return ranked[i].Score > ranked[j].Score
 	})
 
-	response.TotalHits = len(ranked)
+	totalHits := len(ranked)
 
-	// Take top-K only.
 	if len(ranked) > topK {
 		ranked = ranked[:topK]
 	}
 
+	return ranked, totalHits
+}
+
+// scoreTerm scores a single term's posting list. No goroutines.
+// Caller must hold idx.mu.RLock().
+func (idx *Index) scoreTerm(term string, params BM25Params, avgDocLen float64, docCount int) (map[uint32]float64, map[uint32]int) {
+	scores := make(map[uint32]float64)
+	termHits := make(map[uint32]int)
+
+	entry, exists := idx.dictionary[term]
+	if !exists {
+		return scores, termHits
+	}
+
+	for _, p := range entry.Postings {
+		docLen := 0
+		if int(p.DocID) < len(idx.docTable) {
+			docLen = idx.docTable[p.DocID].Length
+		}
+		scores[p.DocID] += params.Score(p.TF, entry.DF, docLen, avgDocLen, docCount)
+		termHits[p.DocID]++
+	}
+
+	return scores, termHits
+}
+
+// scoreTermsParallel scores multiple terms in parallel, one goroutine per term.
+// Each goroutine produces a local score map. Results are merged after all finish.
+// Caller must hold idx.mu.RLock().
+func (idx *Index) scoreTermsParallel(queryTerms []string, params BM25Params, avgDocLen float64, docCount int) (map[uint32]float64, map[uint32]int) {
+	type termResult struct {
+		scores   map[uint32]float64
+		termHits map[uint32]int
+	}
+
+	results := make([]termResult, len(queryTerms))
+	var wg sync.WaitGroup
+
+	for i, term := range queryTerms {
+		wg.Add(1)
+		go func(i int, term string) {
+			defer wg.Done()
+
+			localScores := make(map[uint32]float64)
+			localHits := make(map[uint32]int)
+
+			entry, exists := idx.dictionary[term]
+			if !exists {
+				results[i] = termResult{localScores, localHits}
+				return
+			}
+
+			for _, p := range entry.Postings {
+				docLen := 0
+				if int(p.DocID) < len(idx.docTable) {
+					docLen = idx.docTable[p.DocID].Length
+				}
+				localScores[p.DocID] = params.Score(p.TF, entry.DF, docLen, avgDocLen, docCount)
+				localHits[p.DocID] = 1
+			}
+
+			results[i] = termResult{localScores, localHits}
+		}(i, term)
+	}
+
+	wg.Wait()
+
+	// Merge: single-threaded, no locks needed.
+	merged := make(map[uint32]float64)
+	mergedHits := make(map[uint32]int)
+
+	for _, r := range results {
+		for docID, score := range r.scores {
+			merged[docID] += score
+		}
+		for docID, count := range r.termHits {
+			mergedHits[docID] += count
+		}
+	}
+
+	return merged, mergedHits
+}
+
+// buildResults converts scored docs into SearchResults with snippets.
+// Loads content from disk only for the top-K docs.
+func (idx *Index) buildResults(ranked []ScoredDoc, query string) []SearchResult {
+	if len(ranked) == 0 {
+		return nil
+	}
+
 	// Get the unstemmed query terms for snippet highlighting.
-	// TokenizeWithoutStemming preserves word forms ("programming" not "program")
-	// so highlights look natural to users.
 	snippetTerms := tokenizer.TokenizeWithoutStemming(query)
 
-	// Build results with snippets — content is loaded from disk only
-	// for these top-K results (not all matching documents).
 	results := make([]SearchResult, 0, len(ranked))
 	for _, sd := range ranked {
 		meta := idx.GetDocMeta(sd.DocID)
@@ -154,7 +252,6 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 			continue
 		}
 
-		// Load content from disk (or buffer) for snippet generation.
 		content := idx.GetDocContent(sd.DocID)
 		snippet := ""
 		if content != "" {
@@ -171,8 +268,5 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		})
 	}
 
-	response.Results = results
-	response.TimeTakenMs = float64(time.Since(start).Microseconds()) / 1000.0
-
-	return response
+	return results
 }

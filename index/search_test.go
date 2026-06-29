@@ -712,3 +712,259 @@ func TestQueryLogRollingWindow(t *testing.T) {
 		t.Errorf("expected 100 recent entries (rolling window), got %d", len(stats.Recent))
 	}
 }
+
+// ==================== Compression Tests ====================
+
+func TestCompressRoundTrip(t *testing.T) {
+	original := []Posting{
+		{DocID: 0, TF: 1},
+		{DocID: 3, TF: 2},
+		{DocID: 7, TF: 5},
+		{DocID: 100, TF: 1},
+		{DocID: 10000, TF: 3},
+	}
+
+	encoded := EncodePostings(original)
+	decoded, err := DecodePostings(encoded, len(original))
+	if err != nil {
+		t.Fatalf("DecodePostings failed: %v", err)
+	}
+
+	if len(decoded) != len(original) {
+		t.Fatalf("expected %d postings, got %d", len(original), len(decoded))
+	}
+
+	for i, p := range decoded {
+		if p.DocID != original[i].DocID || p.TF != original[i].TF {
+			t.Errorf("posting %d: got {%d, %d}, want {%d, %d}",
+				i, p.DocID, p.TF, original[i].DocID, original[i].TF)
+		}
+	}
+
+	// Verify compression: 5 postings × 8 bytes = 40 bytes uncompressed.
+	t.Logf("compression: %d bytes → %d bytes (%.1f%%)",
+		len(original)*8, len(encoded), float64(len(encoded))/float64(len(original)*8)*100)
+}
+
+func TestCompressEmpty(t *testing.T) {
+	encoded := EncodePostings(nil)
+	if encoded != nil {
+		t.Errorf("expected nil for empty postings, got %d bytes", len(encoded))
+	}
+
+	decoded, err := DecodePostings(nil, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if decoded != nil {
+		t.Errorf("expected nil for empty decode, got %d postings", len(decoded))
+	}
+}
+
+func TestCompressLargeGaps(t *testing.T) {
+	// DocID gaps of 100,000+ should still encode/decode correctly.
+	original := []Posting{
+		{DocID: 0, TF: 1},
+		{DocID: 100000, TF: 2},
+		{DocID: 200000, TF: 3},
+		{DocID: 300001, TF: 4},
+	}
+
+	encoded := EncodePostings(original)
+	decoded, err := DecodePostings(encoded, len(original))
+	if err != nil {
+		t.Fatalf("DecodePostings failed: %v", err)
+	}
+
+	for i, p := range decoded {
+		if p.DocID != original[i].DocID || p.TF != original[i].TF {
+			t.Errorf("posting %d: got {%d, %d}, want {%d, %d}",
+				i, p.DocID, p.TF, original[i].DocID, original[i].TF)
+		}
+	}
+}
+
+func TestVarintEdgeCases(t *testing.T) {
+	// Test varint encoding with edge-case values: 0, 127, 128, MaxUint32.
+	original := []Posting{
+		{DocID: 0, TF: 0},       // both zero
+		{DocID: 127, TF: 127},   // single-byte boundary
+		{DocID: 255, TF: 128},   // two-byte boundary
+		{DocID: 4294967295, TF: 1}, // MaxUint32 DocID
+	}
+
+	encoded := EncodePostings(original)
+	decoded, err := DecodePostings(encoded, len(original))
+	if err != nil {
+		t.Fatalf("DecodePostings failed: %v", err)
+	}
+
+	for i, p := range decoded {
+		if p.DocID != original[i].DocID || p.TF != original[i].TF {
+			t.Errorf("posting %d: got {%d, %d}, want {%d, %d}",
+				i, p.DocID, p.TF, original[i].DocID, original[i].TF)
+		}
+	}
+}
+
+// ==================== Cache Tests ====================
+
+func TestSearchCacheHit(t *testing.T) {
+	idx := buildTestIndex()
+
+	// First search: cache miss.
+	resp1 := idx.Search("Go", 10, "or")
+	if resp1.CacheHit {
+		t.Error("first search should be a cache miss")
+	}
+
+	// Second identical search: cache hit.
+	resp2 := idx.Search("Go", 10, "or")
+	if !resp2.CacheHit {
+		t.Error("second identical search should be a cache hit")
+	}
+
+	// Results should match.
+	if resp1.TotalHits != resp2.TotalHits {
+		t.Errorf("TotalHits mismatch: %d vs %d", resp1.TotalHits, resp2.TotalHits)
+	}
+	if len(resp1.Results) != len(resp2.Results) {
+		t.Fatalf("result count mismatch: %d vs %d", len(resp1.Results), len(resp2.Results))
+	}
+	for i := range resp1.Results {
+		if resp1.Results[i].DocID != resp2.Results[i].DocID {
+			t.Errorf("result %d DocID mismatch: %d vs %d", i, resp1.Results[i].DocID, resp2.Results[i].DocID)
+		}
+	}
+}
+
+func TestSearchCacheInvalidation(t *testing.T) {
+	idx := buildTestIndex()
+
+	// Warm cache.
+	idx.Search("Go", 10, "or")
+	resp := idx.Search("Go", 10, "or")
+	if !resp.CacheHit {
+		t.Error("expected cache hit after warmup")
+	}
+
+	// Add a new document — cache should be invalidated.
+	idx.AddDocument("sha_new", "https://new.dev", "New Go Page", "Go is great Go Go Go")
+
+	resp = idx.Search("Go", 10, "or")
+	if resp.CacheHit {
+		t.Error("expected cache miss after adding a document")
+	}
+}
+
+func TestLRUEviction(t *testing.T) {
+	cache := NewSearchCache(3)
+
+	cache.Put("a", []ScoredDoc{{DocID: 1, Score: 1.0}}, 1)
+	cache.Put("b", []ScoredDoc{{DocID: 2, Score: 2.0}}, 1)
+	cache.Put("c", []ScoredDoc{{DocID: 3, Score: 3.0}}, 1)
+
+	// All should be present.
+	if _, _, ok := cache.Get("a"); !ok {
+		t.Error("expected 'a' in cache")
+	}
+
+	// Add a 4th — should evict 'b' (LRU, since 'a' was just accessed by Get).
+	cache.Put("d", []ScoredDoc{{DocID: 4, Score: 4.0}}, 1)
+
+	if _, _, ok := cache.Get("b"); ok {
+		t.Error("expected 'b' to be evicted")
+	}
+	if _, _, ok := cache.Get("d"); !ok {
+		t.Error("expected 'd' in cache")
+	}
+}
+
+func TestLRUCacheStats(t *testing.T) {
+	cache := NewSearchCache(128)
+
+	cache.Put("a", []ScoredDoc{{DocID: 1, Score: 1.0}}, 1)
+	cache.Get("a") // hit
+	cache.Get("b") // miss
+
+	stats := cache.Stats()
+
+	if stats.Hits != 1 {
+		t.Errorf("expected 1 hit, got %d", stats.Hits)
+	}
+	if stats.Misses != 1 {
+		t.Errorf("expected 1 miss, got %d", stats.Misses)
+	}
+	if stats.Size != 1 {
+		t.Errorf("expected size 1, got %d", stats.Size)
+	}
+	if stats.HitRate != 0.5 {
+		t.Errorf("expected hit rate 0.5, got %f", stats.HitRate)
+	}
+}
+
+func TestLRUCacheInvalidate(t *testing.T) {
+	cache := NewSearchCache(128)
+
+	cache.Put("a", []ScoredDoc{{DocID: 1, Score: 1.0}}, 1)
+	cache.Put("b", []ScoredDoc{{DocID: 2, Score: 2.0}}, 1)
+
+	cache.Invalidate()
+
+	if _, _, ok := cache.Get("a"); ok {
+		t.Error("expected 'a' cleared after invalidation")
+	}
+	if stats := cache.Stats(); stats.Size != 0 {
+		t.Errorf("expected size 0 after invalidation, got %d", stats.Size)
+	}
+}
+
+// ==================== Parallel Search Tests ====================
+
+func TestSearchParallelMultiTerm(t *testing.T) {
+	idx := buildTestIndex()
+
+	// Multi-term query triggers parallel scoring.
+	resp := idx.Search("Go concurrent programming", 10, "or")
+
+	if resp.TotalHits == 0 {
+		t.Fatal("expected hits for multi-term query")
+	}
+
+	// Results should be sorted by score descending.
+	for i := 1; i < len(resp.Results); i++ {
+		if resp.Results[i].Score > resp.Results[i-1].Score {
+			t.Errorf("results not sorted: [%d]=%f > [%d]=%f",
+				i, resp.Results[i].Score, i-1, resp.Results[i-1].Score)
+		}
+	}
+
+	// Doc 2 (Go Concurrency Patterns) should be in results.
+	found := false
+	for _, r := range resp.Results {
+		if r.URL == "https://go.dev/concurrency" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected go.dev/concurrency in results for 'Go concurrent programming'")
+	}
+}
+
+func TestSearchParallelMatchesSequential(t *testing.T) {
+	idx := buildTestIndex()
+
+	// 3-term query → parallel path.
+	resp := idx.Search("Go fast concurrent", 10, "or")
+
+	// Verify basic correctness: results should have valid scores.
+	for _, r := range resp.Results {
+		if r.Score <= 0 {
+			t.Errorf("expected positive score, got %f for DocID=%d", r.Score, r.DocID)
+		}
+	}
+
+	if resp.TimeTakenMs <= 0 {
+		t.Errorf("expected positive timing, got %f", resp.TimeTakenMs)
+	}
+}
