@@ -340,8 +340,8 @@ func TestSaveAndLoad(t *testing.T) {
 	if dictFile.Meta.DocCount != 3 {
 		t.Errorf("expected DocCount=3, got %d", dictFile.Meta.DocCount)
 	}
-	if dictFile.Meta.Version != 1 {
-		t.Errorf("expected Version=1, got %d", dictFile.Meta.Version)
+	if dictFile.Meta.Version != 2 {
+		t.Errorf("expected Version=2, got %d", dictFile.Meta.Version)
 	}
 
 	// Load doc table
