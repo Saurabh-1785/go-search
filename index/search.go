@@ -27,18 +27,6 @@ type SearchResponse struct {
 }
 
 // Search processes a query string against the index using BM25 scoring.
-//
-// Parameters:
-//   - query: raw user query string (will be tokenized through the same pipeline)
-//   - topK: maximum number of results to return
-//   - mode: "or" (default, any term matches) or "and" (all terms must match)
-//
-// Flow:
-//  1. Tokenize the query through the same pipeline as documents
-//  2. Check cache for previously scored results
-//  3. On cache miss: score with BM25 (parallel for multi-term queries)
-//  4. Cache the scored doc list
-//  5. Generate snippets for top-K results only (lazy content read from disk)
 func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 	start := time.Now()
 
@@ -62,7 +50,6 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		mode = "or"
 	}
 
-	// --- Check cache ---
 	cacheKey := CacheKey(query, topK, mode)
 	if idx.cache != nil {
 		if docs, totalHits, ok := idx.cache.Get(cacheKey); ok {
@@ -74,7 +61,6 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 		}
 	}
 
-	// --- Cache miss: compute scores ---
 	ranked, totalHits := idx.scoreQuery(queryTerms, topK, mode)
 
 	// Cache the scored docs (not the full response).
@@ -90,8 +76,6 @@ func (idx *Index) Search(query string, topK int, mode string) SearchResponse {
 }
 
 // scoreQuery runs BM25 scoring across all query terms.
-// For multi-term queries (≥2 terms), each term is scored in its own goroutine.
-// Returns the ranked top-K scored docs and total hit count.
 func (idx *Index) scoreQuery(queryTerms []string, topK int, mode string) ([]ScoredDoc, int) {
 	params := DefaultBM25()
 
@@ -110,15 +94,12 @@ func (idx *Index) scoreQuery(queryTerms []string, topK int, mode string) ([]Scor
 	}
 	avgDocLen := float64(totalLen) / float64(docCount)
 
-	// --- Scoring: sequential for 1 term, parallel for 2+ ---
 	var scores map[uint32]float64
 	var termHits map[uint32]int
 
 	if len(queryTerms) == 1 {
-		// Single term: no goroutine overhead.
 		scores, termHits = idx.scoreTerm(queryTerms[0], params, avgDocLen, docCount)
 	} else {
-		// Multi-term: parallel scoring with per-goroutine maps.
 		scores, termHits = idx.scoreTermsParallel(queryTerms, params, avgDocLen, docCount)
 	}
 
@@ -155,8 +136,7 @@ func (idx *Index) scoreQuery(queryTerms []string, topK int, mode string) ([]Scor
 	return ranked, totalHits
 }
 
-// scoreTerm scores a single term's posting list. No goroutines.
-// Caller must hold idx.mu.RLock().
+// scoreTerm scores a single term's posting list.
 func (idx *Index) scoreTerm(term string, params BM25Params, avgDocLen float64, docCount int) (map[uint32]float64, map[uint32]int) {
 	scores := make(map[uint32]float64)
 	termHits := make(map[uint32]int)
@@ -179,8 +159,6 @@ func (idx *Index) scoreTerm(term string, params BM25Params, avgDocLen float64, d
 }
 
 // scoreTermsParallel scores multiple terms in parallel, one goroutine per term.
-// Each goroutine produces a local score map. Results are merged after all finish.
-// Caller must hold idx.mu.RLock().
 func (idx *Index) scoreTermsParallel(queryTerms []string, params BM25Params, avgDocLen float64, docCount int) (map[uint32]float64, map[uint32]int) {
 	type termResult struct {
 		scores   map[uint32]float64
@@ -236,7 +214,6 @@ func (idx *Index) scoreTermsParallel(queryTerms []string, params BM25Params, avg
 }
 
 // buildResults converts scored docs into SearchResults with snippets.
-// Loads content from disk only for the top-K docs.
 func (idx *Index) buildResults(ranked []ScoredDoc, query string) []SearchResult {
 	if len(ranked) == 0 {
 		return nil

@@ -5,35 +5,8 @@ import (
 	"fmt"
 )
 
-// --- Delta + Varint Compressed Postings ---
-//
-// Standard format (before compression):
-//   DocID0 (4 bytes) | TF0 (4 bytes) | DocID1 (4 bytes) | TF1 (4 bytes) | ...
-//   = 8 bytes per posting
-//
-// Compressed format:
-//   delta(DocID0) as varint | TF0 as varint | delta(DocID1) as varint | TF1 as varint | ...
-//
-// Delta encoding: posting lists are sorted by DocID. Instead of storing
-// absolute DocIDs, store the difference from the previous DocID:
-//   DocIDs:  [3, 7, 8, 100]
-//   Deltas:  [3, 4, 1, 92]   (first delta = first DocID)
-//
-// Why? Deltas are small numbers → varint encodes them in fewer bytes.
-//
-// Varint: Uses Go's standard library binary.PutUvarint / binary.Uvarint.
-// Same encoding as Protocol Buffers (LEB128).
-//
-// Compression ratio example (1000 postings, DocIDs 0..9999):
-//   Uncompressed: 1000 × 8 = 8,000 bytes
-//   Compressed:   ~1000 × (1+1) ≈ 2,000 bytes (avg delta ~10, TF ~1-5)
-//   Ratio: ~4× compression
-
-// EncodePostings delta+varint encodes a posting list.
-// The postings MUST be sorted by DocID before calling this.
-// Returns the compressed byte slice.
-//
-// Uses binary.PutUvarint from the standard library — no custom varint.
+// EncodePostings delta-varint encodes a list of postings.
+// The postings must be sorted by DocID.
 func EncodePostings(postings []Posting) []byte {
 	if len(postings) == 0 {
 		return nil
@@ -62,10 +35,7 @@ func EncodePostings(postings []Posting) []byte {
 	return buf
 }
 
-// DecodePostings reads a delta+varint encoded posting list.
-// count is the number of postings to decode (from DictEntry.DF).
-//
-// Uses binary.Uvarint from the standard library — no custom varint.
+// DecodePostings decodes a delta-varint encoded posting list.
 func DecodePostings(data []byte, count int) ([]Posting, error) {
 	if count == 0 || len(data) == 0 {
 		return nil, nil

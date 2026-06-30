@@ -713,7 +713,6 @@ func TestQueryLogRollingWindow(t *testing.T) {
 	}
 }
 
-// ==================== Compression Tests ====================
 
 func TestCompressRoundTrip(t *testing.T) {
 	original := []Posting{
@@ -741,9 +740,7 @@ func TestCompressRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Verify compression: 5 postings × 8 bytes = 40 bytes uncompressed.
-	t.Logf("compression: %d bytes → %d bytes (%.1f%%)",
-		len(original)*8, len(encoded), float64(len(encoded))/float64(len(original)*8)*100)
+	t.Logf("compression: %d bytes -> %d bytes", len(original)*8, len(encoded))
 }
 
 func TestCompressEmpty(t *testing.T) {
@@ -762,7 +759,6 @@ func TestCompressEmpty(t *testing.T) {
 }
 
 func TestCompressLargeGaps(t *testing.T) {
-	// DocID gaps of 100,000+ should still encode/decode correctly.
 	original := []Posting{
 		{DocID: 0, TF: 1},
 		{DocID: 100000, TF: 2},
@@ -785,7 +781,6 @@ func TestCompressLargeGaps(t *testing.T) {
 }
 
 func TestVarintEdgeCases(t *testing.T) {
-	// Test varint encoding with edge-case values: 0, 127, 128, MaxUint32.
 	original := []Posting{
 		{DocID: 0, TF: 0},       // both zero
 		{DocID: 127, TF: 127},   // single-byte boundary
@@ -807,24 +802,19 @@ func TestVarintEdgeCases(t *testing.T) {
 	}
 }
 
-// ==================== Cache Tests ====================
 
 func TestSearchCacheHit(t *testing.T) {
 	idx := buildTestIndex()
 
-	// First search: cache miss.
 	resp1 := idx.Search("Go", 10, "or")
 	if resp1.CacheHit {
 		t.Error("first search should be a cache miss")
 	}
 
-	// Second identical search: cache hit.
 	resp2 := idx.Search("Go", 10, "or")
 	if !resp2.CacheHit {
 		t.Error("second identical search should be a cache hit")
 	}
-
-	// Results should match.
 	if resp1.TotalHits != resp2.TotalHits {
 		t.Errorf("TotalHits mismatch: %d vs %d", resp1.TotalHits, resp2.TotalHits)
 	}
@@ -841,14 +831,12 @@ func TestSearchCacheHit(t *testing.T) {
 func TestSearchCacheInvalidation(t *testing.T) {
 	idx := buildTestIndex()
 
-	// Warm cache.
 	idx.Search("Go", 10, "or")
 	resp := idx.Search("Go", 10, "or")
 	if !resp.CacheHit {
 		t.Error("expected cache hit after warmup")
 	}
 
-	// Add a new document — cache should be invalidated.
 	idx.AddDocument("sha_new", "https://new.dev", "New Go Page", "Go is great Go Go Go")
 
 	resp = idx.Search("Go", 10, "or")
@@ -864,12 +852,10 @@ func TestLRUEviction(t *testing.T) {
 	cache.Put("b", []ScoredDoc{{DocID: 2, Score: 2.0}}, 1)
 	cache.Put("c", []ScoredDoc{{DocID: 3, Score: 3.0}}, 1)
 
-	// All should be present.
 	if _, _, ok := cache.Get("a"); !ok {
 		t.Error("expected 'a' in cache")
 	}
 
-	// Add a 4th — should evict 'b' (LRU, since 'a' was just accessed by Get).
 	cache.Put("d", []ScoredDoc{{DocID: 4, Score: 4.0}}, 1)
 
 	if _, _, ok := cache.Get("b"); ok {
@@ -884,8 +870,8 @@ func TestLRUCacheStats(t *testing.T) {
 	cache := NewSearchCache(128)
 
 	cache.Put("a", []ScoredDoc{{DocID: 1, Score: 1.0}}, 1)
-	cache.Get("a") // hit
-	cache.Get("b") // miss
+	cache.Get("a")
+	cache.Get("b")
 
 	stats := cache.Stats()
 
@@ -919,12 +905,9 @@ func TestLRUCacheInvalidate(t *testing.T) {
 	}
 }
 
-// ==================== Parallel Search Tests ====================
 
 func TestSearchParallelMultiTerm(t *testing.T) {
 	idx := buildTestIndex()
-
-	// Multi-term query triggers parallel scoring.
 	resp := idx.Search("Go concurrent programming", 10, "or")
 
 	if resp.TotalHits == 0 {
@@ -954,10 +937,8 @@ func TestSearchParallelMultiTerm(t *testing.T) {
 func TestSearchParallelMatchesSequential(t *testing.T) {
 	idx := buildTestIndex()
 
-	// 3-term query → parallel path.
 	resp := idx.Search("Go fast concurrent", 10, "or")
 
-	// Verify basic correctness: results should have valid scores.
 	for _, r := range resp.Results {
 		if r.Score <= 0 {
 			t.Errorf("expected positive score, got %f for DocID=%d", r.Score, r.DocID)

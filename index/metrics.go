@@ -27,22 +27,7 @@ type EvalReport struct {
 }
 
 // Evaluate runs each query against the index and compares results against
-// human-labeled relevance judgments.
-//
-// For each query:
-//  1. Run Search(query, k, "or") using BM25
-//  2. Check how many of the returned URLs are in the relevant set
-//  3. Compute Precision@K and Recall
-//
-// Precision@K = |relevant docs in top K| / K
-//   - "Of the K results I showed the user, what fraction were relevant?"
-//   - High precision = few irrelevant results in the top K
-//
-// Recall = |relevant docs in top K| / |total relevant docs|
-//   - "Of all the relevant docs that exist, what fraction did I find?"
-//   - High recall = few relevant docs are missed
-//
-// The report also includes mean precision and mean recall across all queries.
+// the provided relevance judgments.
 func Evaluate(idx *Index, judgments []RelevanceJudgment, k int, params BM25Params) EvalReport {
 	report := EvalReport{
 		Results: make([]EvalResult, 0, len(judgments)),

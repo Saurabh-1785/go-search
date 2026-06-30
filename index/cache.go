@@ -20,19 +20,7 @@ type cacheEntry struct {
 	totalHits int
 }
 
-// SearchCache is an LRU (Least Recently Used) cache for search scoring results.
-//
-// Data structure: doubly-linked list (for LRU ordering) + hashmap (for O(1) lookup).
-//
-//   - Get: O(1) — map lookup + move to front
-//   - Put: O(1) — map insert + push to front + evict tail if over capacity
-//   - Invalidate: O(1) — clear both structures
-//
-// Stores []ScoredDoc (ranked scoring results only), NOT SearchResponse.
-// This keeps the cache independent of API formatting — snippets and timing
-// are generated fresh from the cached scored docs.
-//
-// Thread-safe: all methods acquire a mutex.
+// SearchCache is a thread-safe LRU cache for search results.
 type SearchCache struct {
 	mu       sync.Mutex
 	capacity int
@@ -68,10 +56,7 @@ func CacheKey(query string, topK int, mode string) string {
 	return fmt.Sprintf("%s|%d|%s", query, topK, mode)
 }
 
-// Get looks up a query in the cache.
-// Returns the scored docs, total hits, and whether the entry was found.
-//
-// On hit: moves the entry to the front (most recently used).
+// Get retrieves a cached result by key.
 func (c *SearchCache) Get(key string) ([]ScoredDoc, int, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -82,25 +67,21 @@ func (c *SearchCache) Get(key string) ([]ScoredDoc, int, bool) {
 		return nil, 0, false
 	}
 
-	// Move to front (most recently used).
 	c.order.MoveToFront(elem)
 	entry := elem.Value.(*cacheEntry)
 	c.hits++
 
-	// Return a copy to prevent callers from mutating cached data.
 	docs := make([]ScoredDoc, len(entry.docs))
 	copy(docs, entry.docs)
 
 	return docs, entry.totalHits, true
 }
 
-// Put inserts or updates a cache entry.
-// If the cache is at capacity, evicts the least recently used entry.
+// Put inserts or updates a cached result.
 func (c *SearchCache) Put(key string, docs []ScoredDoc, totalHits int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If key already exists, update it and move to front.
 	if elem, exists := c.items[key]; exists {
 		c.order.MoveToFront(elem)
 		entry := elem.Value.(*cacheEntry)
@@ -109,7 +90,6 @@ func (c *SearchCache) Put(key string, docs []ScoredDoc, totalHits int) {
 		return
 	}
 
-	// Evict LRU entry if at capacity.
 	if c.order.Len() >= c.capacity {
 		tail := c.order.Back()
 		if tail != nil {
@@ -118,7 +98,6 @@ func (c *SearchCache) Put(key string, docs []ScoredDoc, totalHits int) {
 		}
 	}
 
-	// Insert new entry at front.
 	entry := &cacheEntry{
 		key:       key,
 		docs:      docs,
@@ -128,8 +107,7 @@ func (c *SearchCache) Put(key string, docs []ScoredDoc, totalHits int) {
 	c.items[key] = elem
 }
 
-// Invalidate clears all cached entries.
-// Called when the index changes (e.g., new documents added).
+// Invalidate clears the cache.
 func (c *SearchCache) Invalidate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

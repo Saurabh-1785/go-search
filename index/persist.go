@@ -18,7 +18,6 @@ const (
 	contentsFile   = "contents.bin"
 )
 
-// --- Dictionary JSON structures ---
 
 // DictMeta holds metadata about the index, written into dictionary.json.
 type DictMeta struct {
@@ -41,15 +40,8 @@ type DictFile struct {
 	Terms map[string]DictEntry `json:"terms"`
 }
 
-// --- Save ---
 
-// SaveIndex persists the index to disk as four files:
-//   - postings.bin  — delta+varint compressed posting lists
-//   - dictionary.json — term → {offset, length, df} + metadata
-//   - docs.json — array of DocMeta for search result display
-//   - contents.bin — raw document content for snippet generation
-//
-// The directory is created if it doesn't exist.
+// SaveIndex persists the index to disk.
 func SaveIndex(idx *Index, dir string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create index dir: %w", err)
@@ -60,7 +52,6 @@ func SaveIndex(idx *Index, dir string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	// --- 1. Write postings.bin ---
 	postingsPath := filepath.Join(dir, postingsFile)
 	pf, err := os.Create(postingsPath)
 	if err != nil {
@@ -102,7 +93,6 @@ func SaveIndex(idx *Index, dir string) error {
 		}
 	}
 
-	// --- 2. Write dictionary.json ---
 	dictFile := DictFile{
 		Meta: DictMeta{
 			DocCount:  len(docTable),
@@ -125,7 +115,6 @@ func SaveIndex(idx *Index, dir string) error {
 		return fmt.Errorf("encode dictionary: %w", err)
 	}
 
-	// --- 3. Write contents.bin and populate DocMeta offsets ---
 	contentsPath := filepath.Join(dir, contentsFile)
 	cf, err := os.Create(contentsPath)
 	if err != nil {
