@@ -4,12 +4,23 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"search-engine/index"
 
 	"github.com/Saurabh-1785/gocrawl/extractor"
 )
+
+// dataDir returns the root directory for persistent data.
+// It reads the DATA_DIR env var, falling back to "data" for local dev.
+func dataDir() string {
+	if d := os.Getenv("DATA_DIR"); d != "" {
+		return d
+	}
+	return "data"
+}
 
 // registerCrawlRoutes sets up the crawl API endpoints on the given mux.
 func registerCrawlRoutes(mux *http.ServeMux, jm *JobManager, idx *index.Index) {
@@ -83,13 +94,14 @@ func handleStartCrawl(w http.ResponseWriter, r *http.Request, jm *JobManager, id
 
 	// Save the index to disk when the crawl finishes.
 	onComplete := func() {
+		idxDir := filepath.Join(dataDir(), "index")
 		stats := idx.Stats()
 		log.Printf("[INDEX] Crawl complete. Saving index: %d terms, %d docs, %d postings",
 			stats.TermCount, stats.DocCount, stats.TotalPostings)
-		if err := index.SaveIndex(idx, "data/index"); err != nil {
+		if err := index.SaveIndex(idx, idxDir); err != nil {
 			log.Printf("[ERROR] Failed to save index: %v", err)
 		} else {
-			log.Printf("[INDEX] Index saved to data/index/")
+			log.Printf("[INDEX] Index saved to %s/", idxDir)
 		}
 	}
 

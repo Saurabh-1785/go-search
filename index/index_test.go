@@ -54,9 +54,9 @@ func TestAddAndGetPostings(t *testing.T) {
 func TestDocumentFrequency(t *testing.T) {
 	idx := NewIndex()
 
-	idx.AddDocument("h1", "u1", "t1", "go go go")          // "go" appears 3 times
-	idx.AddDocument("h2", "u2", "t2", "go is great")        // "go" appears 1 time
-	idx.AddDocument("h3", "u3", "t3", "python is great")    // "go" doesn't appear
+	idx.AddDocument("h1", "u1", "t1", "go go go")        // "go" appears 3 times
+	idx.AddDocument("h2", "u2", "t2", "go is great")     // "go" appears 1 time
+	idx.AddDocument("h3", "u3", "t3", "python is great") // "go" doesn't appear
 
 	entry := idx.GetPostings("go")
 	if entry == nil {

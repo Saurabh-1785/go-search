@@ -18,7 +18,6 @@ const (
 	contentsFile   = "contents.bin"
 )
 
-
 // DictMeta holds metadata about the index, written into dictionary.json.
 type DictMeta struct {
 	DocCount  int `json:"doc_count"`
@@ -39,7 +38,6 @@ type DictFile struct {
 	Meta  DictMeta             `json:"meta"`
 	Terms map[string]DictEntry `json:"terms"`
 }
-
 
 // SaveIndex persists the index to disk.
 func SaveIndex(idx *Index, dir string) error {
