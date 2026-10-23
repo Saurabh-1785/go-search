@@ -135,29 +135,6 @@ func TestTokenizeWithoutStemming(t *testing.T) {
 }
 
 // ============================================================
-// Normalize tests
-// ============================================================
-
-func TestNormalize(t *testing.T) {
-	tests := []struct {
-		input, want string
-	}{
-		{"Hello World", "hello world"},
-		{"ALL CAPS", "all caps"},
-		{"already lowercase", "already lowercase"},
-		{"MiXeD CaSe", "mixed case"},
-		{"", ""},
-	}
-
-	for _, tc := range tests {
-		got := Normalize(tc.input)
-		if got != tc.want {
-			t.Errorf("Normalize(%q) = %q, want %q", tc.input, got, tc.want)
-		}
-	}
-}
-
-// ============================================================
 // Stopword tests
 // ============================================================
 

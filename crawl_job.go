@@ -33,7 +33,6 @@ type CrawlJob struct {
 // CrawlJobResult holds the final metrics from a completed crawl.
 type CrawlJobResult struct {
 	DocumentsWritten int    `json:"documents_written"`
-	DocumentsSkipped int    `json:"documents_skipped"`
 	PagesVisited     int    `json:"pages_visited"`
 	PagesFailed      int    `json:"pages_failed"`
 	Duration         string `json:"duration"`

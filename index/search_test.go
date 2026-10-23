@@ -437,7 +437,7 @@ func TestContentDiskStorage(t *testing.T) {
 	}
 
 	// After save: buffer should be cleared, content readable from disk.
-	if idx.ContentsBuf() != nil {
+	if idx.contentsBuf != nil {
 		t.Error("contentsBuf should be nil after save")
 	}
 
@@ -544,7 +544,7 @@ func TestPrecisionAtK(t *testing.T) {
 		},
 	}
 
-	report := Evaluate(idx, judgments, 10, DefaultBM25())
+	report := Evaluate(idx, judgments, 10)
 
 	if len(report.Results) != 1 {
 		t.Fatalf("expected 1 eval result, got %d", len(report.Results))
@@ -573,7 +573,7 @@ func TestRecall(t *testing.T) {
 		},
 	}
 
-	report := Evaluate(idx, judgments, 10, DefaultBM25())
+	report := Evaluate(idx, judgments, 10)
 	result := report.Results[0]
 
 	// Both relevant docs should be found.
@@ -596,7 +596,7 @@ func TestEvaluateMultipleQueries(t *testing.T) {
 		},
 	}
 
-	report := Evaluate(idx, judgments, 10, DefaultBM25())
+	report := Evaluate(idx, judgments, 10)
 
 	if report.QueriesRun != 2 {
 		t.Errorf("expected QueriesRun=2, got %d", report.QueriesRun)
@@ -616,7 +616,7 @@ func TestEvaluateMultipleQueries(t *testing.T) {
 func TestEvaluateEmptyJudgments(t *testing.T) {
 	idx := buildTestIndex()
 
-	report := Evaluate(idx, []RelevanceJudgment{}, 10, DefaultBM25())
+	report := Evaluate(idx, []RelevanceJudgment{}, 10)
 
 	if report.QueriesRun != 0 {
 		t.Errorf("expected QueriesRun=0, got %d", report.QueriesRun)
@@ -633,7 +633,7 @@ func TestEvaluateNoRelevantFound(t *testing.T) {
 		},
 	}
 
-	report := Evaluate(idx, judgments, 10, DefaultBM25())
+	report := Evaluate(idx, judgments, 10)
 	result := report.Results[0]
 
 	if result.Hits != 0 {

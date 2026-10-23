@@ -28,7 +28,7 @@ type EvalReport struct {
 
 // Evaluate runs each query against the index and compares results against
 // the provided relevance judgments.
-func Evaluate(idx *Index, judgments []RelevanceJudgment, k int, params BM25Params) EvalReport {
+func Evaluate(idx *Index, judgments []RelevanceJudgment, k int) EvalReport {
 	report := EvalReport{
 		Results: make([]EvalResult, 0, len(judgments)),
 	}

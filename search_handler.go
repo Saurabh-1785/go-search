@@ -144,8 +144,7 @@ func handleEval(w http.ResponseWriter, r *http.Request, idx *index.Index) {
 		req.K = 10
 	}
 
-	params := index.DefaultBM25()
-	report := index.Evaluate(idx, req.Judgments, req.K, params)
+	report := index.Evaluate(idx, req.Judgments, req.K)
 
 	log.Printf("[EVAL] %d queries, mean precision@%d=%.3f, mean recall=%.3f",
 		report.QueriesRun, req.K, report.MeanPrecision, report.MeanRecall)

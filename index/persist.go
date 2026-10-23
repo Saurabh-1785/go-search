@@ -57,8 +57,8 @@ func SaveIndex(idx *Index, dir string) error {
 	}
 	defer pf.Close()
 
-	dict := idx.Dictionary()
-	docTable := idx.DocTable()
+	dict := idx.dictionary
+	docTable := idx.docTable
 
 	// Sort terms for deterministic output (easier to diff/debug).
 	termNames := make([]string, 0, len(dict))
@@ -120,7 +120,7 @@ func SaveIndex(idx *Index, dir string) error {
 	}
 	defer cf.Close()
 
-	contentsBuf := idx.ContentsBuf()
+	contentsBuf := idx.contentsBuf
 	var contentOffset int64
 
 	for i := range docTable {

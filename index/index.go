@@ -234,47 +234,6 @@ func (idx *Index) Stats() IndexStats {
 	}
 }
 
-// Dictionary returns the raw dictionary map. Used by SaveIndex for persistence.
-// Caller must hold at least an RLock (or call under Stats/Save which do).
-func (idx *Index) Dictionary() map[string]*TermEntry {
-	return idx.dictionary
-}
-
-// DocTable returns the raw doc table slice. Used by SaveIndex for persistence.
-func (idx *Index) DocTable() []DocMeta {
-	return idx.docTable
-}
-
-// SetDocTable replaces the doc table. Used after loading from disk
-// when content offsets need to be applied.
-func (idx *Index) SetDocTable(table []DocMeta) {
-	idx.docTable = table
-}
-
-// ContentsBuf returns the raw content buffer. Used by SaveIndex.
-func (idx *Index) ContentsBuf() []string {
-	return idx.contentsBuf
-}
-
-// ClearContentsBuf frees the content buffer after it's been flushed to disk.
-func (idx *Index) ClearContentsBuf() {
-	idx.contentsBuf = nil
-}
-
-// ContentDir returns the directory where contents.bin is stored.
-func (idx *Index) ContentDir() string {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return idx.contentDir
-}
-
-// SetContentDir sets the directory where contents.bin is stored.
-func (idx *Index) SetContentDir(dir string) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	idx.contentDir = dir
-}
-
 // GetDocContent reads a document's raw content from the content buffer
 // (during build) or from contents.bin on disk (after save).
 // Returns empty string if content is not available.
@@ -302,14 +261,4 @@ func (idx *Index) GetDocContent(docID uint32) string {
 		return ""
 	}
 	return content
-}
-
-// RLock acquires a read lock on the index. Used by persistence layer.
-func (idx *Index) RLock() {
-	idx.mu.RLock()
-}
-
-// RUnlock releases the read lock. Used by persistence layer.
-func (idx *Index) RUnlock() {
-	idx.mu.RUnlock()
 }

@@ -50,12 +50,6 @@ func TokenizeWithoutStemming(text string) []string {
 	return result
 }
 
-// Normalize lowercases the input text. This is the first step of the pipeline,
-// exposed separately for cases where only normalization is needed.
-func Normalize(text string) string {
-	return strings.ToLower(text)
-}
-
 // tokenizeRaw performs lowercase + split into raw tokens (no filtering or stemming).
 // Splits on any rune that is not a letter or digit, which handles:
 //   - whitespace
