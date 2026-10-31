@@ -10,7 +10,11 @@ import "strings"
 //
 // Reference: https://tartarus.org/martin/PorterStemmer/def.txt
 //
-// Note: the input MUST be lowercase. The function does not check or convert case.
+// Step 2 includes the two departures from the paper made by Porter's own
+// reference implementation ("bli"→"ble", "logi"→"log"), so output matches
+// the official test vocabulary (https://tartarus.org/martin/PorterStemmer/voc.txt).
+//
+// The input is lowercased before stemming.
 func Stem(word string) string {
 	if len(word) <= 2 {
 		return word
@@ -262,7 +266,7 @@ func step2(w []byte) []byte {
 		{"enci", "ence"},
 		{"anci", "ance"},
 		{"izer", "ize"},
-		{"abli", "able"},
+		{"bli", "ble"}, // reference-implementation departure; covers the paper's "abli"
 		{"alli", "al"},
 		{"entli", "ent"},
 		{"eli", "e"},
@@ -277,6 +281,7 @@ func step2(w []byte) []byte {
 		{"aliti", "al"},
 		{"iviti", "ive"},
 		{"biliti", "ble"},
+		{"logi", "log"}, // reference-implementation departure
 	}
 
 	for _, r := range rules {

@@ -46,7 +46,7 @@ func TestTokenize_Hyphens(t *testing.T) {
 	// "well" → "well", "known" → "known"
 	// "state" → "state", "of" stopword, "the" stopword, "art" → "art"
 	// "technology" → stemmed
-	want := []string{"well", "known", "state", "art", "technologi"}
+	want := []string{"well", "known", "state", "art", "technolog"}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Tokenize with hyphens:\n  got  = %v\n  want = %v", got, want)
@@ -256,6 +256,9 @@ func TestStem_Step2_DoubleSuffixes(t *testing.T) {
 		{"formaliti", "formal"},
 		{"sensitiviti", "sensit"},
 		{"sensibiliti", "sensibl"},
+		{"possibly", "possibl"},
+		{"humbly", "humbl"},
+		{"apology", "apolog"},
 	}
 	for _, tc := range tests {
 		got := Stem(tc.input)
