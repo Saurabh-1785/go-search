@@ -73,7 +73,7 @@ func NewIndex() *Index {
 	}
 }
 
-// AddDocument tokenizes the content, assigns an internal uint32 DocID,
+// AddDocument tokenizes the title and content, assigns an internal uint32 DocID,
 // stores metadata in docTable, and appends postings for each unique term.
 //
 // The tokenization (CPU-heavy) runs outside the lock. The lock is held
@@ -82,11 +82,13 @@ func NewIndex() *Index {
 // Parameters:
 //   - externalID: the SHA-256 document hash from the crawler
 //   - url: the page URL (for search result display)
-//   - title: the page title (for search result display)
+//   - title: the page title (indexed and used for search result display)
 //   - content: the raw text content to tokenize and index
 func (idx *Index) AddDocument(externalID, url, title, content string) {
 	// --- Phase 1: Tokenize outside the lock (CPU-heavy) ---
-	tokens := tokenizer.Tokenize(content)
+	// The title is indexed along with the body: crawlers often skip the
+	// nav/header/footer where a page's name appears, leaving it only in <title>.
+	tokens := tokenizer.Tokenize(title + " " + content)
 
 	// Count term frequencies in a local map.
 	// This avoids taking the lock once per token.

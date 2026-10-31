@@ -86,6 +86,28 @@ func TestDocumentFrequency(t *testing.T) {
 	}
 }
 
+func TestTitleIndexed(t *testing.T) {
+	idx := NewIndex()
+
+	// The name appears only in the title, not in the body.
+	idx.AddDocument("h1", "https://example.com", "Saurabh Chauhan", "Projects and blog posts")
+
+	resp := idx.Search("saurabh", 10, "or")
+	if resp.TotalHits != 1 {
+		t.Fatalf("expected 1 hit for title-only term, got %d", resp.TotalHits)
+	}
+
+	// Title and body tokens both count toward document length.
+	if got := idx.GetDocMeta(0).Length; got != 5 {
+		t.Errorf("expected Length=5 (2 title + 3 body tokens), got %d", got)
+	}
+
+	// Snippets come from the body only, so the stored content excludes the title.
+	if got := idx.GetDocContent(0); got != "Projects and blog posts" {
+		t.Errorf("expected stored content to be the body only, got %q", got)
+	}
+}
+
 func TestDocTable(t *testing.T) {
 	idx := NewIndex()
 

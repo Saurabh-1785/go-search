@@ -54,7 +54,7 @@ func main() {
 	addr := ":" + port
 	fmt.Println()
 	fmt.Println("  ╔═══════════════════════════════════╗")
-	fmt.Println("  ║         GoSearch API v3.0          ║")
+	fmt.Println("  ║         GoSearch API v1.0          ║")
 	fmt.Println("  ╚═══════════════════════════════════╝")
 	fmt.Println()
 	log.Printf("[INFO]  Server starting on %s", addr)
