@@ -377,8 +377,11 @@ Standard Go layout: `cmd/` holds the entrypoint, `internal/` holds one package p
 │       ├── tokenizer.go      — full pipeline: normalize → split → stopwords → stem
 │       └── ...               — stopword list, Porter stemmer
 ├── deploy/
-│   ├── azure-setup.sh        — provision Azure resources and deploy
-│   ├── update.sh             — rebuild and redeploy after code changes
+│   ├── azure.env             — shared names/settings (override via env vars)
+│   ├── lib.sh                — shared helpers: preflight, image tags, waits
+│   ├── azure-setup.sh        — create or update the whole stack (idempotent)
+│   ├── update.sh             — rebuild and roll out a new revision
+│   ├── azure-teardown.sh     — delete the app (keep data) or everything
 │   └── README.md             — step-by-step Azure deployment guide
 ├── data/index/               — persisted index (gitignored)
 ├── docs/                     — personal notes (gitignored)
@@ -391,33 +394,16 @@ Dependencies point one way: `cmd` → `server` → `crawljob`, `netguard`, `rate
 
 ## Deploying to Azure
 
-The application is containerized and designed to run on Azure Container Apps with index data persisted to an Azure File Share so it survives container restarts.
-
-See [deploy/README.md](deploy/README.md) for the complete guide.
-
-Quick summary:
+The app runs on Azure Container Apps, with the index on an Azure File Share so it survives restarts. Full guide: [deploy/README.md](deploy/README.md).
 
 ```bash
-# 1. Install az CLI and log in
-curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-az login
-
-# 2. Register Azure providers (one-time)
-az provider register --namespace Microsoft.App
-az provider register --namespace Microsoft.OperationalInsights
-
-# 3. Run setup (set DOCKER_USER to your Docker Hub username)
-chmod +x deploy/azure-setup.sh
-DOCKER_USER=yourname ./deploy/azure-setup.sh
+az login && docker login
+DOCKER_USER=yourname ./deploy/azure-setup.sh   # create or update everything (safe to re-run)
+DOCKER_USER=yourname ./deploy/update.sh        # after a code change: new image, new revision
+./deploy/azure-teardown.sh                     # delete the app, keep the index
 ```
 
-The script provisions a Standard LRS Storage Account, a 5 GiB File Share, and a Container App with the share mounted at `/mnt/data`. The `DATA_DIR=/mnt/data` environment variable is set automatically.
-
-To redeploy after a code change:
-
-```bash
-DOCKER_USER=yourname ./deploy/update.sh
-```
+The setup script checks prerequisites first, keeps your existing admin key on re-runs, tags every image uniquely (`<UTC time>-<git sha>`), and waits until `/health` responds.
 
 ---
 

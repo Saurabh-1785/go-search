@@ -1,29 +1,42 @@
 #!/usr/bin/env bash
-# deploy/update.sh — Rebuild & redeploy after a code change
-# Usage: DOCKER_USER=you ./deploy/update.sh
-
+# =============================================================================
+# deploy/update.sh — rebuild the image and roll out a new revision after a
+# code change. Infrastructure, secrets and the index data are left as they are.
+#
+# Usage:  DOCKER_USER=yourDockerHubUsername ./deploy/update.sh
+#
+# Each run pushes a unique tag (<UTC time>-<git sha>), so Azure always creates
+# a new revision. Re-pushing ':latest' would not: the image string wouldn't
+# change, so 'containerapp update' would have nothing to roll out.
+# =============================================================================
 set -euo pipefail
 
-DOCKER_USER="${DOCKER_USER:?Please set DOCKER_USER}"
-IMAGE="${DOCKER_USER}/gosearch:latest"
-RESOURCE_GROUP="go-search-rg"
-CONTAINER_APP_NAME="go-search"
+DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/azure.env
+source "${DEPLOY_DIR}/azure.env"
+# shellcheck source=deploy/lib.sh
+source "${DEPLOY_DIR}/lib.sh"
 
-echo "▶ Building & pushing ${IMAGE}..."
-# Build from the project root no matter where the script is run from.
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-docker build --platform linux/amd64 -t "${IMAGE}" "${PROJECT_ROOT}"
-docker push "${IMAGE}"
+step "Preflight checks"
+require_tools az docker curl git
+require_docker_user
+require_az_login
+require_docker
+app_exists || die "Container app '${CONTAINER_APP_NAME}' not found in '${RESOURCE_GROUP}'.
+  Create it first: DOCKER_USER=${DOCKER_USER} ./deploy/azure-setup.sh"
 
-echo "▶ Updating container revision..."
-az containerapp update \
-  --name "${CONTAINER_APP_NAME}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --image "${IMAGE}" \
+IMAGE="$(build_and_push)"
+
+step "Rolling out ${IMAGE}"
+az containerapp update -n "$CONTAINER_APP_NAME" -g "$RESOURCE_GROUP" --image "$IMAGE" --output none
+
+wait_provisioned
+FQDN="$(app_fqdn)"
+wait_healthy "$FQDN"
+
+step "Revisions"
+az containerapp revision list -n "$CONTAINER_APP_NAME" -g "$RESOURCE_GROUP" \
+  --query "[].{revision:name, active:properties.active, created:properties.createdTime, image:properties.template.containers[0].image}" \
   --output table
 
-echo "✅ New revision deployed."
-az containerapp revision list \
-  --name "${CONTAINER_APP_NAME}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --output table
+printf '\n✅ Deployed %s to https://%s\n' "$IMAGE" "$FQDN"

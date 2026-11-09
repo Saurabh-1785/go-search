@@ -21,15 +21,16 @@ FROM alpine:3.20
 # Trust system CA certs (needed for the crawler to reach HTTPS sites)
 RUN apk add --no-cache ca-certificates
 
-# Non-root user for security
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+# Non-root user with a fixed UID/GID (10001), so the Azure file share can be
+# mounted owned by this user (APP_UID in deploy/azure.env must match).
+RUN addgroup -S -g 10001 appgroup && adduser -S -u 10001 -G appgroup appuser
 
 WORKDIR /app
 
 COPY --from=builder /gosearch ./gosearch
 
 # DATA_DIR is the root for persistent data.
-# On Azure Container Apps it is overridden to the Azure File Share mount path.
+# On Azure Container Apps it is overridden to the file share mount path (/mnt/data).
 # The default (/app/data) keeps local-dev behaviour without a volume.
 ENV DATA_DIR=/app/data \
     PORT=8080

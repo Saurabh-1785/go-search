@@ -1,264 +1,227 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy/azure-setup.sh
+# deploy/azure-setup.sh — create or update the whole go-search stack on
+# Azure Container Apps. Safe to re-run: existing resources are reused, and the
+# existing admin API key is kept.
 #
-# Provisions all Azure resources for go-search and deploys the container.
-#
-# Prerequisites:
-#   - az CLI installed and logged in  (az login)
-#   - Docker installed and running
-#   - Docker Hub account  (or swap to ACR — see comments below)
+# Prerequisites: az (logged in: az login), docker (running, docker login),
+#                jq, curl, openssl, git
 #
 # Usage:
-#   chmod +x deploy/azure-setup.sh
 #   DOCKER_USER=yourDockerHubUsername ./deploy/azure-setup.sh
+#
+# Optional overrides (see deploy/azure.env): LOCATION, RESOURCE_GROUP,
+# STORAGE_ACCOUNT, ... and ADMIN_API_KEY to set a specific key.
+#
+# What it creates:
+#   resource group → storage account (+ file share for the index)
+#   → Container Apps environment (+ the share registered as storage)
+#   → container app: 1 replica max, HTTPS ingress, health probes,
+#     admin key as a secret, share mounted at /mnt/data
 # =============================================================================
-
 set -euo pipefail
 
-# ── CONFIG — edit these if you want different names ──────────────────────────
-RESOURCE_GROUP="go-search-rg"
-LOCATION="centralindia"            # change to a region close to you
-STORAGE_ACCOUNT="gosearchstorage"        # stable name — safe to re-run
-SHARE_NAME="go-search-data"
-SHARE_QUOTA_GB=5                  # 5 GB is within Azure free-tier allowance
+DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/azure.env
+source "${DEPLOY_DIR}/azure.env"
+# shellcheck source=deploy/lib.sh
+source "${DEPLOY_DIR}/lib.sh"
 
-CONTAINER_APP_ENV="go-search-env"
-CONTAINER_APP_NAME="go-search"
-IMAGE_NAME="gosearch"
-IMAGE_TAG="latest"
+# ── 0. Preflight ──────────────────────────────────────────────────────────────
+step "[0/8] Preflight checks"
+require_tools az docker jq curl openssl git
+require_docker_user
+require_az_login
+require_docker
+[[ "$STORAGE_ACCOUNT" =~ ^[a-z0-9]{3,24}$ ]] \
+  || die "STORAGE_ACCOUNT must be 3-24 lowercase letters/digits (got '${STORAGE_ACCOUNT}')."
+[[ -z "${ADMIN_API_KEY:-}" || ${#ADMIN_API_KEY} -ge 16 ]] \
+  || die "ADMIN_API_KEY must be at least 16 characters."
 
-# Docker Hub (free) — set DOCKER_USER in your shell before running
-DOCKER_USER="${DOCKER_USER:?Please set DOCKER_USER to your Docker Hub username}"
-FULL_IMAGE="${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
+# ── 1. Resource providers (one-time per subscription; no-op afterwards) ─────
+step "[1/8] Registering resource providers"
+for ns in Microsoft.App Microsoft.OperationalInsights Microsoft.Storage; do
+  az provider register --namespace "$ns" --wait --output none
+  info "$ns registered"
+done
 
-# Admin API key for /crawl, /eval, /crawl/jobs, /search/stats.
-# Pass ADMIN_API_KEY to keep an existing key; otherwise a new one is generated.
-# It is stored as a Container Apps secret, not as a plain env var.
-ADMIN_API_KEY="${ADMIN_API_KEY:-$(openssl rand -hex 32)}"
-if [ "${#ADMIN_API_KEY}" -lt 16 ]; then
-  echo "ADMIN_API_KEY must be at least 16 characters" >&2
-  exit 1
+# ── 2. Resource group ────────────────────────────────────────────────────────
+step "[2/8] Resource group ${RESOURCE_GROUP} (${LOCATION})"
+az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
+
+# ── 3. Storage account + file share (holds the index across restarts) ───────
+step "[3/8] Storage account ${STORAGE_ACCOUNT} and share ${SHARE_NAME}"
+if az storage account show -n "$STORAGE_ACCOUNT" -g "$RESOURCE_GROUP" --output none 2>/dev/null; then
+  info "Storage account exists — reusing it (existing index data is kept)"
+  az storage account update -n "$STORAGE_ACCOUNT" -g "$RESOURCE_GROUP" \
+    --https-only true --min-tls-version TLS1_2 --allow-blob-public-access false \
+    --output none
+else
+  available="$(az storage account check-name --name "$STORAGE_ACCOUNT" --query nameAvailable --output tsv)"
+  [[ "$available" == "true" ]] || die "Storage account name '${STORAGE_ACCOUNT}' is taken globally.
+  Pick another: STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=${DOCKER_USER} $0"
+  # Hardened defaults: HTTPS only, TLS 1.2+, no anonymous blob access.
+  az storage account create -n "$STORAGE_ACCOUNT" -g "$RESOURCE_GROUP" -l "$LOCATION" \
+    --sku Standard_LRS --kind StorageV2 \
+    --https-only true --min-tls-version TLS1_2 --allow-blob-public-access false \
+    --output none
+  info "Created storage account"
 fi
 
-# Build from the project root no matter where the script is run from.
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# share-rm goes through Azure Resource Manager, so no storage key is needed here.
+if [[ "$(az storage share-rm exists -g "$RESOURCE_GROUP" --storage-account "$STORAGE_ACCOUNT" \
+        -n "$SHARE_NAME" --query exists --output tsv)" == "true" ]]; then
+  info "File share exists — reusing it"
+else
+  az storage share-rm create -g "$RESOURCE_GROUP" --storage-account "$STORAGE_ACCOUNT" \
+    -n "$SHARE_NAME" --quota "$SHARE_QUOTA_GB" --output none
+  info "Created file share (${SHARE_QUOTA_GB} GiB)"
+fi
 
-# ── STEP 1: Resource Group ────────────────────────────────────────────────────
-echo ""
-echo "▶ [1/8] Creating resource group: ${RESOURCE_GROUP} (${LOCATION})"
-az group create \
-  --name "${RESOURCE_GROUP}" \
-  --location "${LOCATION}" \
-  --output table
+# ── 4. Build and push the image (unique tag per deploy) ──────────────────────
+step "[4/8] Container image"
+IMAGE="$(build_and_push)"
+info "Image: ${IMAGE}"
 
-# ── STEP 2: Storage Account ───────────────────────────────────────────────────
-echo ""
-echo "▶ [2/8] Creating storage account: ${STORAGE_ACCOUNT}"
-echo "       (Standard LRS — cheapest option, ~\$0.02/GB/month)"
-az storage account create \
-  --name "${STORAGE_ACCOUNT}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --location "${LOCATION}" \
-  --sku Standard_LRS \
-  --kind StorageV2 \
-  --output table
+# ── 5. Container Apps environment ───────────────────────────────────────────
+step "[5/8] Container Apps environment ${CONTAINER_APP_ENV}"
+if az containerapp env show -n "$CONTAINER_APP_ENV" -g "$RESOURCE_GROUP" --output none 2>/dev/null; then
+  info "Environment exists — reusing it"
+else
+  # Creates a Log Analytics workspace for container logs (small cost per GB).
+  az containerapp env create -n "$CONTAINER_APP_ENV" -g "$RESOURCE_GROUP" -l "$LOCATION" --output none
+  info "Created environment"
+fi
 
-# Grab the storage account key for later steps
-STORAGE_KEY=$(az storage account keys list \
-  --account-name "${STORAGE_ACCOUNT}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --query "[0].value" \
-  --output tsv)
+# ── 6. Register the file share with the environment ─────────────────────────
+step "[6/8] Attaching file share to the environment as '${ENV_STORAGE_NAME}'"
+# 'storage set' is an upsert: re-running refreshes the account key. The key
+# is read into a variable and passed to az only — never printed.
+STORAGE_KEY="$(az storage account keys list -n "$STORAGE_ACCOUNT" -g "$RESOURCE_GROUP" \
+  --query '[0].value' --output tsv)"
+az containerapp env storage set -n "$CONTAINER_APP_ENV" -g "$RESOURCE_GROUP" \
+  --storage-name "$ENV_STORAGE_NAME" \
+  --azure-file-account-name "$STORAGE_ACCOUNT" \
+  --azure-file-account-key "$STORAGE_KEY" \
+  --azure-file-share-name "$SHARE_NAME" \
+  --access-mode ReadWrite --output none
+unset STORAGE_KEY
 
-# ── STEP 3: File Share ────────────────────────────────────────────────────────
-echo ""
-echo "▶ [3/8] Creating Azure File Share: ${SHARE_NAME} (${SHARE_QUOTA_GB} GiB)"
-az storage share create \
-  --name "${SHARE_NAME}" \
-  --account-name "${STORAGE_ACCOUNT}" \
-  --account-key "${STORAGE_KEY}" \
-  --quota "${SHARE_QUOTA_GB}" \
-  --output table
+# ── 7. Admin API key: explicit > existing secret > new ──────────────────────
+step "[7/8] Admin API key"
+KEY_IS_NEW=false
+if [[ -n "${ADMIN_API_KEY:-}" ]]; then
+  info "Using ADMIN_API_KEY from the environment"
+elif app_exists && ADMIN_API_KEY="$(az containerapp secret show -n "$CONTAINER_APP_NAME" \
+        -g "$RESOURCE_GROUP" --secret-name admin-api-key --query value --output tsv 2>/dev/null)" \
+     && [[ -n "$ADMIN_API_KEY" ]]; then
+  info "Keeping the existing admin key from the app's secret"
+else
+  ADMIN_API_KEY="$(openssl rand -hex 32)"
+  KEY_IS_NEW=true
+  info "Generated a new admin key"
+fi
+(( ${#ADMIN_API_KEY} >= 16 )) || die "ADMIN_API_KEY must be at least 16 characters."
 
-# Pre-create the index sub-directory inside the share
-echo "       Creating index/ sub-directory in file share..."
-az storage directory create \
-  --share-name "${SHARE_NAME}" \
-  --name "index" \
-  --account-name "${STORAGE_ACCOUNT}" \
-  --account-key "${STORAGE_KEY}" \
-  --output table
-
-# ── STEP 4: Build & Push Docker image ────────────────────────────────────────
-echo ""
-echo "▶ [4/8] Building Docker image: ${FULL_IMAGE}"
-docker build \
-  --platform linux/amd64 \
-  -t "${FULL_IMAGE}" \
-  "${PROJECT_ROOT}"
-
-echo ""
-echo "▶ [5/8] Pushing image to Docker Hub..."
-echo "       (make sure you are logged in: docker login)"
-docker push "${FULL_IMAGE}"
-
-# ── STEP 5: Container Apps Environment ───────────────────────────────────────
-echo ""
-echo "▶ [6/8] Creating Container Apps environment: ${CONTAINER_APP_ENV}"
-az containerapp env create \
-  --name "${CONTAINER_APP_ENV}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --location "${LOCATION}" \
-  --output table
-
-# ── STEP 6: Attach the File Share as a storage volume ────────────────────────
-echo ""
-echo "▶ [7/8] Attaching Azure File Share to Container Apps environment"
-
-# 'env storage set' cannot update share/account name — only the key.
-# Delete any existing entry first so the step is safely re-runnable.
-echo "       Removing any existing 'gosearchfiles' storage entry (safe to ignore if not found)..."
-az containerapp env storage remove \
-  --name "${CONTAINER_APP_ENV}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --storage-name "gosearchfiles" \
-  --yes \
-  --output none 2>/dev/null || true
-
-az containerapp env storage set \
-  --name "${CONTAINER_APP_ENV}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --storage-name "gosearchfiles" \
-  --azure-file-account-name "${STORAGE_ACCOUNT}" \
-  --azure-file-account-key "${STORAGE_KEY}" \
-  --azure-file-share-name "${SHARE_NAME}" \
-  --access-mode ReadWrite \
-  --output table
-
-# ── STEP 7: Create the Container App via ARM REST API ────────────────────────
-# 'az containerapp create' has no --volume flags, and its --yaml flag has a
-# known parsing bug (400 "System.Boolean" error). We bypass it entirely and
-# call the ARM REST API directly with az rest, which accepts JSON natively.
+# ── 8. Create or update the container app (ARM PUT = full desired state) ────
+# Why az rest and not 'az containerapp create': the create command cannot
+# declare volumes, and its --yaml input has had parsing bugs. A PUT of the
+# full JSON spec is idempotent: same input, same result.
 #
 # maxReplicas is 1 on purpose: the index, rate limiter and job list live in
-# process memory, and only one process may write the index on the file share.
-# Several replicas would each serve a different index and race on saves.
-echo ""
-echo "▶ [8/8] Deploying Container App: ${CONTAINER_APP_NAME}"
+# process memory, and only one process may write the index on the share.
+step "[8/8] Deploying container app ${CONTAINER_APP_NAME}"
+SUBSCRIPTION_ID="$(az account show --query id --output tsv)"
+ENV_ID="$(az containerapp env show -n "$CONTAINER_APP_ENV" -g "$RESOURCE_GROUP" --query id --output tsv)"
 
-SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+# The body holds the admin key: mktemp creates it with mode 0600, and the
+# trap removes it however the script exits. jq builds the JSON, so values are
+# escaped properly whatever they contain.
+BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/go-search-app-XXXXXX.json")"
+trap 'rm -f "$BODY_FILE"' EXIT
 
-ENV_ID=$(az containerapp env show \
-  --name "${CONTAINER_APP_ENV}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --query id \
-  --output tsv)
-
-echo "       Subscription : ${SUBSCRIPTION_ID}"
-echo "       Environment  : ${ENV_ID}"
-
-# Write the request body as JSON (native API format, no YAML parsing).
-# The file holds the admin key: mktemp creates it mode 0600, and the trap
-# deletes it even if a later step fails.
-JSON_FILE="$(mktemp /tmp/go-search-app-XXXXXX.json)"
-trap 'rm -f "${JSON_FILE}"' EXIT
-cat > "${JSON_FILE}" << JSON
-{
-  "location": "${LOCATION}",
-  "properties": {
-    "managedEnvironmentId": "${ENV_ID}",
-    "configuration": {
-      "ingress": {
-        "external": true,
-        "targetPort": 8080,
-        "transport": "auto",
-        "allowInsecure": false
+jq -n \
+  --arg location "$LOCATION" \
+  --arg envId "$ENV_ID" \
+  --arg image "$IMAGE" \
+  --arg key "$ADMIN_API_KEY" \
+  --arg storageName "$ENV_STORAGE_NAME" \
+  --arg mountOptions "uid=${APP_UID},gid=${APP_UID},dir_mode=0750,file_mode=0640" \
+  '{
+    location: $location,
+    properties: {
+      managedEnvironmentId: $envId,
+      configuration: {
+        activeRevisionsMode: "Single",
+        ingress: { external: true, targetPort: 8080, transport: "auto", allowInsecure: false },
+        secrets: [ { name: "admin-api-key", value: $key } ]
       },
-      "secrets": [
-        { "name": "admin-api-key", "value": "${ADMIN_API_KEY}" }
-      ]
-    },
-    "template": {
-      "scale": {
-        "minReplicas": 0,
-        "maxReplicas": 1
-      },
-      "volumes": [
-        {
-          "name": "gosearch-vol",
-          "storageType": "AzureFile",
-          "storageName": "gosearchfiles"
-        }
-      ],
-      "containers": [
-        {
-          "name": "go-search",
-          "image": "${FULL_IMAGE}",
-          "resources": {
-            "cpu": 0.5,
-            "memory": "1Gi"
-          },
-          "env": [
-            { "name": "DATA_DIR",            "value": "/mnt/data" },
-            { "name": "PORT",                "value": "8080" },
-            { "name": "TRUST_PROXY_HEADERS", "value": "true" },
-            { "name": "ADMIN_API_KEY",       "secretRef": "admin-api-key" }
+      template: {
+        scale: { minReplicas: 0, maxReplicas: 1 },
+        volumes: [ {
+          name: "index-data", storageType: "AzureFile", storageName: $storageName,
+          mountOptions: $mountOptions
+        } ],
+        containers: [ {
+          name: "go-search",
+          image: $image,
+          resources: { cpu: 0.5, memory: "1Gi" },
+          env: [
+            { name: "DATA_DIR",            value: "/mnt/data" },
+            { name: "PORT",                value: "8080" },
+            { name: "TRUST_PROXY_HEADERS", value: "true" },
+            { name: "ADMIN_API_KEY",       secretRef: "admin-api-key" }
           ],
-          "volumeMounts": [
-            {
-              "volumeName": "gosearch-vol",
-              "mountPath": "/mnt/data"
-            }
+          volumeMounts: [ { volumeName: "index-data", mountPath: "/mnt/data" } ],
+          probes: [
+            { type: "Startup",  httpGet: { path: "/health", port: 8080 },
+              initialDelaySeconds: 2, periodSeconds: 3, failureThreshold: 40 },
+            { type: "Liveness", httpGet: { path: "/health", port: 8080 },
+              periodSeconds: 30, failureThreshold: 3 }
           ]
-        }
-      ]
+        } ]
+      }
     }
-  }
-}
-JSON
+  }' > "$BODY_FILE"
 
-echo "       Sending PUT request to ARM API..."
-az rest \
-  --method PUT \
+az rest --method PUT \
   --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}?api-version=2024-03-01" \
   --headers "Content-Type=application/json" \
-  --body @"${JSON_FILE}" \
+  --body "@${BODY_FILE}" \
   --output none
+rm -f "$BODY_FILE"
 
-rm -f "${JSON_FILE}"
+wait_provisioned
+FQDN="$(app_fqdn)"
+wait_healthy "$FQDN"
 
-echo ""
-echo "       Waiting for provisioning to complete..."
-az containerapp show \
-  --name "${CONTAINER_APP_NAME}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --query "{name:name, state:properties.provisioningState, fqdn:properties.configuration.ingress.fqdn}" \
-  --output table
+# ── Done ─────────────────────────────────────────────────────────────────────
+cat <<EOF
 
-# ── Done ──────────────────────────────────────────────────────────────────────
-APP_URL=$(az containerapp show \
-  --name "${CONTAINER_APP_NAME}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --query "properties.configuration.ingress.fqdn" \
-  --output tsv)
+════════════════════════════════════════════════════════════
+  ✅  go-search is live
+  URL      : https://${FQDN}
+  Health   : https://${FQDN}/health
+  Image    : ${IMAGE}
+  Index    : ${STORAGE_ACCOUNT} → file share ${SHARE_NAME} → index/
+EOF
+if [[ "$KEY_IS_NEW" == true ]]; then
+  cat <<EOF
 
-echo ""
-echo "════════════════════════════════════════════════════════"
-echo "  ✅  Deployment complete!"
-echo ""
-echo "  App URL : https://${APP_URL}"
-echo "  Health  : https://${APP_URL}/health"
-echo ""
-echo "  Storage account : ${STORAGE_ACCOUNT}"
-echo "  File share      : ${SHARE_NAME}"
-echo "  Mount path      : /mnt/data  (DATA_DIR inside container)"
-echo ""
-echo "  Admin API key (store it now — it is not shown again):"
-echo "    ${ADMIN_API_KEY}"
-echo "  Use it as:  curl -H 'Authorization: Bearer <key>' https://${APP_URL}/crawl/jobs"
-echo ""
-echo "  Crawl data lives at:"
-echo "    Azure Portal → Storage Accounts → ${STORAGE_ACCOUNT}"
-echo "    → File shares → ${SHARE_NAME} → index/"
-echo "════════════════════════════════════════════════════════"
+  Admin API key (new — store it now; re-runs keep it):
+    ${ADMIN_API_KEY}
+EOF
+else
+  cat <<EOF
+
+  Admin API key unchanged. To view it:
+    az containerapp secret show -n ${CONTAINER_APP_NAME} -g ${RESOURCE_GROUP} --secret-name admin-api-key --query value -o tsv
+EOF
+fi
+cat <<EOF
+
+  Try:  curl -X POST https://${FQDN}/crawl \\
+          -H "Authorization: Bearer \$ADMIN_API_KEY" \\
+          -d '{"url":"https://go.dev","max_pages":20}'
+════════════════════════════════════════════════════════════
+EOF

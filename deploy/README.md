@@ -1,183 +1,169 @@
 # Azure Deployment Guide — go-search
 
-This guide deploys **go-search** to **Azure Container Apps** (free consumption tier) with
-crawl/index data persisted on an **Azure File Share** that survives container restarts.
+Deploys **go-search** to **Azure Container Apps** (consumption tier, scales to zero), with the search index persisted on an **Azure File Share**, so it survives restarts and redeploys.
 
 ---
 
 ## Architecture
 
 ```
-Azure Container Apps  ──mount──▶  Azure File Share (go-search-data)
-  /mnt/data/index/                 └── index/
-                                       ├── CURRENT          ← names the active generation
-                                       ├── gen-000003/      ← previous (fallback)
-                                       └── gen-000004/      ← active
-                                           ├── dictionary.json
-                                           ├── docs.json
-                                           ├── postings.bin
-                                           └── contents.bin
+Internet ──HTTPS──▶ Container Apps ingress (TLS, appends X-Forwarded-For)
+                      │
+                      ▼
+                    container app "go-search"  (max 1 replica, 0.5 vCPU / 1 GiB)
+                      │  env: DATA_DIR=/mnt/data, TRUST_PROXY_HEADERS=true,
+                      │       ADMIN_API_KEY ← secret "admin-api-key"
+                      │  probes: startup + liveness on /health
+                      │
+                      └── mount /mnt/data ──▶ Azure File Share "go-search-data"
+                                               └── index/
+                                                   ├── CURRENT          ← names the active generation
+                                                   ├── gen-000003/      ← previous (fallback)
+                                                   └── gen-000004/      ← active
+                                                       ├── dictionary.json  docs.json
+                                                       └── postings.bin     contents.bin
 ```
 
-The container env var `DATA_DIR=/mnt/data` is picked up by the app to read/write index files.
+**Why one replica?** The index, rate limiter and job list live in process memory, and only one process may write the index on the share. Several replicas would serve different results and race on saves.
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `azure.env` | All names and settings (region, resource group, storage account…). Any value can be overridden by exporting it. |
+| `lib.sh` | Shared helpers: preflight checks, unique image tags, build/push, wait for provisioning and health |
+| `azure-setup.sh` | Create **or update** the whole stack. Safe to re-run. |
+| `update.sh` | Code change → new image → new revision. Leaves infrastructure and data alone. |
+| `azure-teardown.sh` | Delete the app (keep the index), or everything with `--everything` |
 
 ---
 
 ## Prerequisites
 
-Install and log in to the Azure CLI:
+| Tool | Check | Install |
+|---|---|---|
+| Azure CLI, logged in | `az account show` | `curl -sL https://aka.ms/InstallAzureCLIDeb \| sudo bash`, then `az login` |
+| Docker, running | `docker info` | Docker Desktop. **On WSL:** Settings → Resources → WSL integration → enable your distro |
+| Docker Hub login | `docker login` | Free account at [hub.docker.com](https://hub.docker.com) |
+| `jq`, `curl`, `openssl`, `git` | `jq --version` | `sudo apt install jq curl openssl git` |
 
-```bash
-# Install on Ubuntu/Debian
-curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+The setup script checks all of these first and stops with the fix if one is missing. Azure logins expire after 90 days without use; just run `az login` again.
 
-# Log in (opens browser for Azure for Students auth)
-az login
-
-# Verify your subscription
-az account show
-az account list --output table
-```
-
-Install Docker (if not already installed):
-
-```bash
-# Ubuntu/Debian quick-install
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER   # log out and back in after this
-```
-
-Create a free [Docker Hub](https://hub.docker.com) account if you don't have one, then log in:
-
-```bash
-docker login
-```
+> **Image visibility:** Docker Hub repositories are **public** by default. The image contains only the compiled binary (no secrets, no data), so that's acceptable. For a private image, use Azure Container Registry (Basic tier, ~$5/month).
 
 ---
 
-## Step 1 — Register required Azure providers
-
-```bash
-az provider register --namespace Microsoft.App
-az provider register --namespace Microsoft.OperationalInsights
-# These can take 1-2 minutes; check with:
-az provider show --namespace Microsoft.App --query registrationState
-```
-
----
-
-## Step 2 — Run the setup script
+## Deploy
 
 ```bash
 cd /path/to/go-search
-
-# Make the scripts executable
-chmod +x deploy/azure-setup.sh deploy/update.sh
-
-# Set your Docker Hub username and run
 DOCKER_USER=yourDockerHubUsername ./deploy/azure-setup.sh
-
-# Re-running? Pass your existing key to keep it, otherwise a new one is generated:
-# ADMIN_API_KEY=<existing key> DOCKER_USER=... ./deploy/azure-setup.sh
 ```
 
-The script will:
-1. Create resource group `go-search-rg` in `westeurope`
-2. Create a Standard LRS Storage Account
-3. Create a 5 GiB File Share `go-search-data`
-4. Build the Docker image and push to Docker Hub
-5. Create a Container Apps environment
-6. Attach the File Share as a named volume
-7. Deploy the container with `DATA_DIR=/mnt/data`, `TRUST_PROXY_HEADERS=true`, a single replica, and the admin API key stored as a Container Apps secret
+Different region or names:
 
-At the end it prints the **admin API key**. Save it: you need it for `/crawl`, `/eval`, `/crawl/jobs` and `/search/stats`.
+```bash
+LOCATION=westeurope STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=you ./deploy/azure-setup.sh
+```
 
-> **Why one replica?** The index, rate limiter and job list live in process memory, and only one process may write the index on the file share.
+What it does (each step reuses what already exists):
 
-> **Estimated time:** 5–10 minutes
+| Step | Action |
+|---|---|
+| 0 | Preflight: tools, Azure login, Docker running, valid names |
+| 1 | Register `Microsoft.App`, `Microsoft.OperationalInsights`, `Microsoft.Storage` (no-op after the first time) |
+| 2 | Resource group `go-search-rg` in `centralindia` |
+| 3 | Storage account (HTTPS only, TLS 1.2+, no public blob access) and a 5 GiB file share |
+| 4 | Build `linux/amd64` image, push as `docker.io/<you>/gosearch:<UTC time>-<git sha>` |
+| 5 | Container Apps environment (creates a Log Analytics workspace for logs) |
+| 6 | Register the share with the environment (refreshes the storage key on re-runs) |
+| 7 | Admin API key: `ADMIN_API_KEY` if you set it, else the **existing** key from the app's secret, else a new random one |
+| 8 | PUT the full app spec, wait until provisioning succeeds and `/health` returns 200 |
+
+At the end it prints the URL and, **only if the key is new**, the admin API key. Store it. Later you can read it with:
+
+```bash
+az containerapp secret show -n go-search -g go-search-rg --secret-name admin-api-key --query value -o tsv
+```
+
+> **Estimated time:** 5–10 minutes the first time, 2–3 minutes after.
 
 ---
 
-## Step 3 — Verify the deployment
+## Verify
 
 ```bash
-# Get the app URL
-APP_URL=$(az containerapp show \
-  --name go-search \
-  --resource-group go-search-rg \
-  --query "properties.configuration.ingress.fqdn" \
-  --output tsv)
+APP=https://$(az containerapp show -n go-search -g go-search-rg --query properties.configuration.ingress.fqdn -o tsv)
+KEY=$(az containerapp secret show -n go-search -g go-search-rg --secret-name admin-api-key --query value -o tsv)
 
-echo "App URL: https://$APP_URL"
+curl $APP/health
 
-# Health check
-curl https://$APP_URL/health
+# Admin endpoints need the key — this must return 401:
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $APP/crawl -d '{}'
 
-# Trigger a test crawl (admin key printed by the setup script)
-ADMIN_API_KEY=<key from setup output>
-curl -X POST https://$APP_URL/crawl \
-  -H "Authorization: Bearer $ADMIN_API_KEY" \
+# Start a crawl
+curl -X POST $APP/crawl -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "url": "https://example.com",
-    "depth": 1,
-    "max_pages": 5,
-    "workers": 2
-  }'
+  -d '{"url": "https://go.dev", "depth": 1, "max_pages": 20}'
 
-# Check index stats (should show docs after crawl completes)
-curl https://$APP_URL/index/stats
+# Follow it, then search
+curl -H "Authorization: Bearer $KEY" $APP/crawl/jobs
+curl "$APP/search?q=goroutines"
 ```
 
----
-
-## Step 4 — Verify persistence across restarts
+### Persistence check
 
 ```bash
-# Force a new revision (simulates a restart)
-az containerapp update \
-  --name go-search \
-  --resource-group go-search-rg \
-  --image yourDockerHubUsername/gosearch:latest
-
-# Index stats should still show the same doc_count — data survived!
-curl https://$APP_URL/index/stats
+curl $APP/index/stats                 # note doc_count
+DOCKER_USER=you ./deploy/update.sh    # new revision = new container
+curl $APP/index/stats                 # same doc_count: loaded from the share on startup
 ```
 
-The index is saved after every crawl and when the container receives `SIGTERM` (scale-to-zero, new revision), then loaded on startup. With `minReplicas: 0`, Azure can scale the app to zero while a crawl runs, since a crawl is not an HTTP request. Whatever was indexed up to that point is saved. Set `minReplicas` to 1 if long crawls must finish.
+The index is saved after every crawl and when the container gets `SIGTERM` (scale to zero, new revision), and loaded on startup. With `minReplicas: 0`, Azure can scale the app to zero **during** a crawl, since a crawl is not an HTTP request. What was indexed so far is saved; the rest of the crawl stops. If long crawls must finish, set `minReplicas` to 1 in `azure-setup.sh` (costs more: the replica runs all the time).
 
-You can also browse the files in **Azure Portal**:
-`Storage Accounts → <your-account> → File shares → go-search-data → index/`
+You can browse the files in the portal: **Storage accounts → gosearchstorage → File shares → go-search-data → index/**.
 
 ---
 
-## Updating the app after code changes
+## Update after a code change
 
 ```bash
 DOCKER_USER=yourDockerHubUsername ./deploy/update.sh
 ```
 
+Builds, pushes a new unique tag, rolls out a new revision, waits for `/health`, and lists revisions. A new tag every time is what makes Azure roll out: re-pushing `:latest` and "updating" to the same image string creates no new revision. Tags ending in `-dirty` were built from uncommitted changes.
+
+Roll back to an earlier image:
+
+```bash
+az containerapp update -n go-search -g go-search-rg --image docker.io/you/gosearch:<older tag>
+```
+
+---
+
+## Teardown
+
+```bash
+./deploy/azure-teardown.sh               # delete app + environment, KEEP the index (storage)
+./deploy/azure-teardown.sh --everything  # delete the whole resource group, including the index
+```
+
+Both ask for confirmation. After the default teardown, `azure-setup.sh` recreates the app and it loads the existing index from the share.
+
 ---
 
 ## Cost estimate (Azure for Students)
 
-| Resource | SKU | Est. Cost |
+| Resource | SKU | Est. cost |
 |---|---|---|
-| Storage Account | Standard LRS | ~$0.02/GB/mo (5 GB ≈ $0.10/mo) |
-| Azure File Share | 5 GiB quota | Included above |
-| Container Apps | Consumption (0.5 vCPU, 1 GiB) | Free allowance: 180k vCPU-s/mo |
-| **Total** | | **~$0–$1/month** |
+| Storage account + 5 GiB share | Standard LRS | ~$0.10–0.30/month |
+| Container Apps | Consumption, 0.5 vCPU / 1 GiB, scales to zero | Within the monthly free grant for light use |
+| Log Analytics | Pay per GB ingested | Cents for this app's log volume |
+| **Total** | | **~$0–$1/month** at hobby traffic |
 
-> Azure for Students gives you $100 credit + free services — this stack fits easily within the free tier.
-
----
-
-## Teardown (when done)
-
-```bash
-# Delete everything — storage, app, environment, all at once
-az group delete --name go-search-rg --yes --no-wait
-```
+Prices change; check the Azure pricing calculator before relying on these numbers.
 
 ---
 
@@ -185,7 +171,12 @@ az group delete --name go-search-rg --yes --no-wait
 
 | Symptom | Fix |
 |---|---|
-| `az containerapp create` fails with "extension not found" | `az extension add --name containerapp` |
-| Container starts but `DATA_DIR` is wrong | Check env vars: `az containerapp show --name go-search -g go-search-rg --query "properties.template.containers[0].env"` |
-| File share not mounted | Check volume: `az containerapp env storage show --name go-search-env -g go-search-rg --storage-name gosearchfiles` |
-| Image pull errors | Re-run `docker login` and `docker push` |
+| `✖ Azure CLI is not logged in (or the login expired)` | `az login` |
+| `✖ Docker is not running` on WSL | Docker Desktop → Settings → Resources → WSL integration → enable the distro |
+| `✖ Storage account name … is taken globally` | `STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=you ./deploy/azure-setup.sh` |
+| `docker push failed` | `docker login`; check `DOCKER_USER` matches your Docker Hub username |
+| Provisioning `Failed` | `az containerapp revision list -n go-search -g go-search-rg -o table`, then `az containerapp logs show -n go-search -g go-search-rg --tail 100` |
+| Health check never passes | Logs (above). `Failed to load index` means a corrupt generation: point `index/CURRENT` at the previous `gen-…` directory in the share |
+| Empty index after a restart | Logs should say `Loaded index from /mnt/data/index`. `No saved index` means the share isn't mounted: `az containerapp env storage show -n go-search-env -g go-search-rg --storage-name gosearchfiles` |
+| `permission denied` writing `/mnt/data` | The share is mounted as UID 10001; `APP_UID` in `azure.env` must match the Dockerfile user |
+| Everyone gets `429` at once | `TRUST_PROXY_HEADERS` must be `true` behind the ingress, or all users share one rate-limit bucket |
