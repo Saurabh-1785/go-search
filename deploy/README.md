@@ -32,11 +32,19 @@ Internet ──HTTPS──▶ Container Apps ingress (TLS, appends X-Forwarded-F
 
 | File | Purpose |
 |---|---|
-| `azure.env` | All names and settings (region, resource group, storage account…). Any value can be overridden by exporting it. |
-| `lib.sh` | Shared helpers: preflight checks, unique image tags, build/push, wait for provisioning and health |
-| `azure-setup.sh` | Create **or update** the whole stack. Safe to re-run. |
-| `update.sh` | Code change → new image → new revision. Leaves infrastructure and data alone. |
-| `azure-teardown.sh` | Delete the app (keep the index), or everything with `--everything` |
+| `azure.sh` | The only script. Settings sit at the top (each one can be overridden by exporting it). Commands: `up`, `update`, `down` |
+| `README.md` | This guide |
+
+```bash
+./deploy/azure.sh help
+```
+
+| Command | What it does |
+|---|---|
+| `up` | Create **or update** the whole stack. Safe to re-run: reuses resources, keeps the admin key |
+| `update` | Code change → new image → new revision. Leaves infrastructure, secret and data alone |
+| `down` | Delete the app and environment, **keep** the index (storage) |
+| `down --everything` | Delete the whole resource group, including the index |
 
 ---
 
@@ -49,7 +57,7 @@ Internet ──HTTPS──▶ Container Apps ingress (TLS, appends X-Forwarded-F
 | Docker Hub login | `docker login` | Free account at [hub.docker.com](https://hub.docker.com) |
 | `jq`, `curl`, `openssl`, `git` | `jq --version` | `sudo apt install jq curl openssl git` |
 
-The setup script checks all of these first and stops with the fix if one is missing. Azure logins expire after 90 days without use; just run `az login` again.
+`up` and `update` check all of these first and stop with the fix if one is missing. Azure logins expire after 90 days without use; just run `az login` again.
 
 > **Image visibility:** Docker Hub repositories are **public** by default. The image contains only the compiled binary (no secrets, no data), so that's acceptable. For a private image, use Azure Container Registry (Basic tier, ~$5/month).
 
@@ -59,13 +67,13 @@ The setup script checks all of these first and stops with the fix if one is miss
 
 ```bash
 cd /path/to/go-search
-DOCKER_USER=yourDockerHubUsername ./deploy/azure-setup.sh
+DOCKER_USER=yourDockerHubUsername ./deploy/azure.sh up
 ```
 
 Different region or names:
 
 ```bash
-LOCATION=westeurope STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=you ./deploy/azure-setup.sh
+LOCATION=westeurope STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=you ./deploy/azure.sh up
 ```
 
 What it does (each step reuses what already exists):
@@ -117,11 +125,11 @@ curl "$APP/search?q=goroutines"
 
 ```bash
 curl $APP/index/stats                 # note doc_count
-DOCKER_USER=you ./deploy/update.sh    # new revision = new container
+DOCKER_USER=you ./deploy/azure.sh update    # new revision = new container
 curl $APP/index/stats                 # same doc_count: loaded from the share on startup
 ```
 
-The index is saved after every crawl and when the container gets `SIGTERM` (scale to zero, new revision), and loaded on startup. With `minReplicas: 0`, Azure can scale the app to zero **during** a crawl, since a crawl is not an HTTP request. What was indexed so far is saved; the rest of the crawl stops. If long crawls must finish, set `minReplicas` to 1 in `azure-setup.sh` (costs more: the replica runs all the time).
+The index is saved after every crawl and when the container gets `SIGTERM` (scale to zero, new revision), and loaded on startup. With `minReplicas: 0`, Azure can scale the app to zero **during** a crawl, since a crawl is not an HTTP request. What was indexed so far is saved; the rest of the crawl stops. If long crawls must finish, set `minReplicas` to 1 in `cmd_up` of `azure.sh` (costs more: the replica runs all the time).
 
 You can browse the files in the portal: **Storage accounts → gosearchstorage → File shares → go-search-data → index/**.
 
@@ -130,7 +138,7 @@ You can browse the files in the portal: **Storage accounts → gosearchstorage �
 ## Update after a code change
 
 ```bash
-DOCKER_USER=yourDockerHubUsername ./deploy/update.sh
+DOCKER_USER=yourDockerHubUsername ./deploy/azure.sh update
 ```
 
 Builds, pushes a new unique tag, rolls out a new revision, waits for `/health`, and lists revisions. A new tag every time is what makes Azure roll out: re-pushing `:latest` and "updating" to the same image string creates no new revision. Tags ending in `-dirty` were built from uncommitted changes.
@@ -146,11 +154,11 @@ az containerapp update -n go-search -g go-search-rg --image docker.io/you/gosear
 ## Teardown
 
 ```bash
-./deploy/azure-teardown.sh               # delete app + environment, KEEP the index (storage)
-./deploy/azure-teardown.sh --everything  # delete the whole resource group, including the index
+./deploy/azure.sh down               # delete app + environment, KEEP the index (storage)
+./deploy/azure.sh down --everything  # delete the whole resource group, including the index
 ```
 
-Both ask for confirmation. After the default teardown, `azure-setup.sh` recreates the app and it loads the existing index from the share.
+Both ask for confirmation. After `down`, `up` recreates the app and it loads the existing index from the share.
 
 ---
 
@@ -173,10 +181,10 @@ Prices change; check the Azure pricing calculator before relying on these number
 |---|---|
 | `✖ Azure CLI is not logged in (or the login expired)` | `az login` |
 | `✖ Docker is not running` on WSL | Docker Desktop → Settings → Resources → WSL integration → enable the distro |
-| `✖ Storage account name … is taken globally` | `STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=you ./deploy/azure-setup.sh` |
+| `✖ Storage account name … is taken globally` | `STORAGE_ACCOUNT=gosearch$RANDOM DOCKER_USER=you ./deploy/azure.sh up` |
 | `docker push failed` | `docker login`; check `DOCKER_USER` matches your Docker Hub username |
 | Provisioning `Failed` | `az containerapp revision list -n go-search -g go-search-rg -o table`, then `az containerapp logs show -n go-search -g go-search-rg --tail 100` |
 | Health check never passes | Logs (above). `Failed to load index` means a corrupt generation: point `index/CURRENT` at the previous `gen-…` directory in the share |
 | Empty index after a restart | Logs should say `Loaded index from /mnt/data/index`. `No saved index` means the share isn't mounted: `az containerapp env storage show -n go-search-env -g go-search-rg --storage-name gosearchfiles` |
-| `permission denied` writing `/mnt/data` | The share is mounted as UID 10001; `APP_UID` in `azure.env` must match the Dockerfile user |
+| `permission denied` writing `/mnt/data` | The share is mounted as UID 10001; `APP_UID` at the top of `azure.sh` must match the Dockerfile user |
 | Everyone gets `429` at once | `TRUST_PROXY_HEADERS` must be `true` behind the ingress, or all users share one rate-limit bucket |

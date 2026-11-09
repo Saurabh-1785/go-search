@@ -377,11 +377,7 @@ Standard Go layout: `cmd/` holds the entrypoint, `internal/` holds one package p
 │       ├── tokenizer.go      — full pipeline: normalize → split → stopwords → stem
 │       └── ...               — stopword list, Porter stemmer
 ├── deploy/
-│   ├── azure.env             — shared names/settings (override via env vars)
-│   ├── lib.sh                — shared helpers: preflight, image tags, waits
-│   ├── azure-setup.sh        — create or update the whole stack (idempotent)
-│   ├── update.sh             — rebuild and roll out a new revision
-│   ├── azure-teardown.sh     — delete the app (keep data) or everything
+│   ├── azure.sh              — one script: up | update | down [--everything]
 │   └── README.md             — step-by-step Azure deployment guide
 ├── data/index/               — persisted index (gitignored)
 ├── docs/                     — personal notes (gitignored)
@@ -398,12 +394,12 @@ The app runs on Azure Container Apps, with the index on an Azure File Share so i
 
 ```bash
 az login && docker login
-DOCKER_USER=yourname ./deploy/azure-setup.sh   # create or update everything (safe to re-run)
-DOCKER_USER=yourname ./deploy/update.sh        # after a code change: new image, new revision
-./deploy/azure-teardown.sh                     # delete the app, keep the index
+DOCKER_USER=yourname ./deploy/azure.sh up      # create or update everything (safe to re-run)
+DOCKER_USER=yourname ./deploy/azure.sh update  # after a code change: new image, new revision
+./deploy/azure.sh down                         # delete the app, keep the index
 ```
 
-The setup script checks prerequisites first, keeps your existing admin key on re-runs, tags every image uniquely (`<UTC time>-<git sha>`), and waits until `/health` responds.
+`up` checks prerequisites first, keeps your existing admin key on re-runs, tags every image uniquely (`<UTC time>-<git sha>`), and waits until `/health` responds.
 
 ---
 

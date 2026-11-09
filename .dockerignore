@@ -1,0 +1,7 @@
+# Keep the Docker build context small: only Go sources are needed.
+.git
+/gosearch
+data/
+docs/
+deploy/
+*.md

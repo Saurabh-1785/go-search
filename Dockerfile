@@ -22,7 +22,7 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 
 # Non-root user with a fixed UID/GID (10001), so the Azure file share can be
-# mounted owned by this user (APP_UID in deploy/azure.env must match).
+# mounted owned by this user (APP_UID in deploy/azure.sh must match).
 RUN addgroup -S -g 10001 appgroup && adduser -S -u 10001 -G appgroup appuser
 
 WORKDIR /app
