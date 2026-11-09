@@ -1,12 +1,15 @@
 package index
 
 import (
+	"html"
+	"sort"
 	"strings"
 	"unicode"
 )
 
 // GenerateSnippet extracts a text snippet from content around the first
 // occurrence of a query term and highlights all matched terms with <mark> tags.
+// The result is HTML-escaped and safe to render as HTML.
 //
 // Algorithm:
 //  1. Find the earliest occurrence of any query term in the content
@@ -102,47 +105,65 @@ func GenerateSnippet(content string, queryTerms []string, windowSize int) string
 	return prefix + snippet + suffix
 }
 
-// highlightTerms wraps all occurrences of query terms in <mark> tags.
-// Case-insensitive matching, preserves original casing in output.
+// highlightTerms HTML-escapes text and wraps all occurrences of query terms
+// in <mark> tags. Matching is case-insensitive and preserves original casing.
+//
+// Crawled page text is untrusted: it is escaped so the snippet is safe to
+// render as HTML (only the <mark> tags added here are markup). Matches are
+// found on the raw text in one pass, so a term can never match inside
+// a <mark> tag or an HTML entity.
 func highlightTerms(text string, terms []string) string {
-	if len(terms) == 0 {
-		return text
+	lower := strings.ToLower(text)
+	if len(lower) != len(text) {
+		// Lowercasing changed byte offsets (rare Unicode case) — skip
+		// highlighting rather than risk misaligned spans.
+		return html.EscapeString(text)
 	}
 
-	// Process each term — replace all case-insensitive occurrences.
-	result := text
+	type span struct{ start, end int }
+	var spans []span
 	for _, term := range terms {
-		if term == "" {
+		t := strings.ToLower(term)
+		if t == "" {
 			continue
 		}
-
-		termLower := strings.ToLower(term)
-		var builder strings.Builder
-		remaining := result
-		remainingLower := strings.ToLower(remaining)
-
-		for {
-			idx := strings.Index(remainingLower, termLower)
-			if idx == -1 {
-				builder.WriteString(remaining)
+		for from := 0; ; {
+			i := strings.Index(lower[from:], t)
+			if i == -1 {
 				break
 			}
-
-			// Write text before the match.
-			builder.WriteString(remaining[:idx])
-
-			// Write the highlighted match (preserving original case).
-			builder.WriteString("<mark>")
-			builder.WriteString(remaining[idx : idx+len(term)])
-			builder.WriteString("</mark>")
-
-			// Advance past the match.
-			remaining = remaining[idx+len(term):]
-			remainingLower = remainingLower[idx+len(term):]
+			start := from + i
+			spans = append(spans, span{start, start + len(t)})
+			from = start + len(t)
 		}
-
-		result = builder.String()
+	}
+	if len(spans) == 0 {
+		return html.EscapeString(text)
 	}
 
-	return result
+	// Merge overlapping spans (e.g. terms "go" and "golang").
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	merged := spans[:1]
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start <= last.end {
+			if s.end > last.end {
+				last.end = s.end
+			}
+			continue
+		}
+		merged = append(merged, s)
+	}
+
+	var b strings.Builder
+	prev := 0
+	for _, s := range merged {
+		b.WriteString(html.EscapeString(text[prev:s.start]))
+		b.WriteString("<mark>")
+		b.WriteString(html.EscapeString(text[s.start:s.end]))
+		b.WriteString("</mark>")
+		prev = s.end
+	}
+	b.WriteString(html.EscapeString(text[prev:]))
+	return b.String()
 }

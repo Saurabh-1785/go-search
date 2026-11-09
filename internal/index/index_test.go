@@ -346,9 +346,13 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatalf("SaveIndex failed: %v", err)
 	}
 
-	// Verify all 4 files exist
+	// Verify all 4 files exist in the active generation
+	genDir, err := resolveIndexDir(dir)
+	if err != nil {
+		t.Fatalf("resolveIndexDir: %v", err)
+	}
 	for _, name := range []string{postingsFile, dictionaryFile, docsFile, contentsFile} {
-		path := filepath.Join(dir, name)
+		path := filepath.Join(genDir, name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			t.Fatalf("expected file %s to exist", name)
 		}
@@ -430,8 +434,11 @@ func TestCompressedPostingSize(t *testing.T) {
 	}
 
 	// Read the raw binary file.
-	postingsPath := filepath.Join(dir, postingsFile)
-	data, err := os.ReadFile(postingsPath)
+	genDir, err := resolveIndexDir(dir)
+	if err != nil {
+		t.Fatalf("resolveIndexDir: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(genDir, postingsFile))
 	if err != nil {
 		t.Fatalf("read postings.bin: %v", err)
 	}

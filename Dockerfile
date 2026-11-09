@@ -13,7 +13,7 @@ RUN go mod download
 # Copy source and build a fully-static binary
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w" -o /gosearch .
+    go build -trimpath -ldflags="-s -w" -o /gosearch ./cmd/gosearch
 
 # ─── Stage 2: Run ─────────────────────────────────────────────────────────────
 FROM alpine:3.20

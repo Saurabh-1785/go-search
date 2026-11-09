@@ -9,11 +9,14 @@ crawl/index data persisted on an **Azure File Share** that survives container re
 
 ```
 Azure Container Apps  ──mount──▶  Azure File Share (go-search-data)
-  /mnt/data/index/                 ├── index/
-    dictionary.json                │   ├── dictionary.json
-    docs.json                      │   ├── docs.json
-    postings.bin                   │   ├── postings.bin
-    contents.bin                   │   └── contents.bin
+  /mnt/data/index/                 └── index/
+                                       ├── CURRENT          ← names the active generation
+                                       ├── gen-000003/      ← previous (fallback)
+                                       └── gen-000004/      ← active
+                                           ├── dictionary.json
+                                           ├── docs.json
+                                           ├── postings.bin
+                                           └── contents.bin
 ```
 
 The container env var `DATA_DIR=/mnt/data` is picked up by the app to read/write index files.
@@ -73,6 +76,9 @@ chmod +x deploy/azure-setup.sh deploy/update.sh
 
 # Set your Docker Hub username and run
 DOCKER_USER=yourDockerHubUsername ./deploy/azure-setup.sh
+
+# Re-running? Pass your existing key to keep it, otherwise a new one is generated:
+# ADMIN_API_KEY=<existing key> DOCKER_USER=... ./deploy/azure-setup.sh
 ```
 
 The script will:
@@ -82,7 +88,11 @@ The script will:
 4. Build the Docker image and push to Docker Hub
 5. Create a Container Apps environment
 6. Attach the File Share as a named volume
-7. Deploy the container with `DATA_DIR=/mnt/data`
+7. Deploy the container with `DATA_DIR=/mnt/data`, `TRUST_PROXY_HEADERS=true`, a single replica, and the admin API key stored as a Container Apps secret
+
+At the end it prints the **admin API key**. Save it: you need it for `/crawl`, `/eval`, `/crawl/jobs` and `/search/stats`.
+
+> **Why one replica?** The index, rate limiter and job list live in process memory, and only one process may write the index on the file share.
 
 > **Estimated time:** 5–10 minutes
 
@@ -103,8 +113,10 @@ echo "App URL: https://$APP_URL"
 # Health check
 curl https://$APP_URL/health
 
-# Trigger a test crawl
+# Trigger a test crawl (admin key printed by the setup script)
+ADMIN_API_KEY=<key from setup output>
 curl -X POST https://$APP_URL/crawl \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "url": "https://example.com",
@@ -131,6 +143,8 @@ az containerapp update \
 # Index stats should still show the same doc_count — data survived!
 curl https://$APP_URL/index/stats
 ```
+
+The index is saved after every crawl and when the container receives `SIGTERM` (scale-to-zero, new revision), then loaded on startup. With `minReplicas: 0`, Azure can scale the app to zero while a crawl runs, since a crawl is not an HTTP request. Whatever was indexed up to that point is saved. Set `minReplicas` to 1 if long crawls must finish.
 
 You can also browse the files in **Azure Portal**:
 `Storage Accounts → <your-account> → File shares → go-search-data → index/`

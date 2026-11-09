@@ -1,7 +1,7 @@
 package index
 
 import (
-	"search-engine/tokenizer"
+	"search-engine/internal/tokenizer"
 	"sort"
 	"sync"
 	"time"

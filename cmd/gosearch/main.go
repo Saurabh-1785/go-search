@@ -1,74 +1,110 @@
+// Command gosearch runs the go-search HTTP server.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"search-engine/index"
+	"search-engine/internal/config"
+	"search-engine/internal/index"
+	"search-engine/internal/netguard"
+	"search-engine/internal/server"
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("[ERROR] %v", err)
+	}
+	if cfg.GeneratedKey {
+		log.Printf("[WARN]  ADMIN_API_KEY not set — generated a key for this run only: %s", cfg.AdminKey)
 	}
 
-	// Initialize job manager
-	jm := NewJobManager()
+	if cfg.AllowPrivateTargets {
+		log.Printf("[WARN]  ALLOW_PRIVATE_TARGETS=true — SSRF protection is OFF. Use only for local development.")
+	} else {
+		netguard.Install()
+	}
 
-	// Initialize inverted index (shared across all crawl jobs)
-	idx := index.NewIndex()
+	idx := loadIndex(cfg.IndexDir())
+	srv := server.New(cfg, idx)
 
-	// Initialize query log for latency/QPS tracking
-	ql := index.NewQueryLog()
+	httpSrv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second, // Slowloris protection
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
 
-	// Set up routes
-	mux := http.NewServeMux()
+	printBanner(httpSrv.Addr)
 
-	// Health check
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":  "ok",
-			"service": "go-search",
-		})
-	})
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// Index stats — returns term count, doc count, total postings
-	mux.HandleFunc("/index/stats", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-			return
-		}
-		writeJSON(w, http.StatusOK, idx.Stats())
-	})
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpSrv.ListenAndServe() }()
 
-	// Crawl API
-	registerCrawlRoutes(mux, jm, idx)
+	select {
+	case err := <-serveErr:
+		log.Fatalf("[ERROR] Server failed: %v", err)
+	case <-ctx.Done():
+	}
 
-	// Search API
-	registerSearchRoutes(mux, idx, ql)
+	// Graceful shutdown: stop taking requests, then save anything indexed
+	// since the last save. Container platforms send SIGTERM before killing
+	// the process (e.g. Azure scale-to-zero), so this is what keeps the
+	// index across restarts when a crawl is still running.
+	log.Printf("[INFO]  Shutting down...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[WARN]  HTTP shutdown: %v", err)
+	}
+	srv.SaveIndex()
+	log.Printf("[INFO]  Bye.")
+}
 
-	// Start server
-	addr := ":" + port
+// loadIndex restores the index saved by a previous run, or starts empty.
+func loadIndex(dir string) *index.Index {
+	idx, err := index.LoadIndex(dir)
+	switch {
+	case errors.Is(err, index.ErrNoIndex):
+		log.Printf("[INFO]  No saved index in %s — starting empty", dir)
+		return index.NewIndex()
+	case err != nil:
+		// Refuse to start rather than run empty and overwrite good data
+		// with the next save.
+		log.Fatalf("[ERROR] Failed to load index from %s: %v", dir, err)
+	}
+	s := idx.Stats()
+	log.Printf("[INFO]  Loaded index from %s: %d docs, %d terms", dir, s.DocCount, s.TermCount)
+	return idx
+}
+
+func printBanner(addr string) {
 	fmt.Println()
 	fmt.Println("  ╔═══════════════════════════════════╗")
 	fmt.Println("  ║         GoSearch API v1.0          ║")
 	fmt.Println("  ╚═══════════════════════════════════╝")
 	fmt.Println()
 	log.Printf("[INFO]  Server starting on %s", addr)
-	log.Printf("[INFO]  Endpoints:")
+	log.Printf("[INFO]  Public endpoints:")
+	log.Printf("[INFO]    GET  /search?q=...&k=10   — BM25 ranked search")
+	log.Printf("[INFO]    GET  /index/stats         — index statistics")
+	log.Printf("[INFO]    GET  /health              — health check")
+	log.Printf("[INFO]  Admin endpoints (Authorization: Bearer <ADMIN_API_KEY>):")
 	log.Printf("[INFO]    POST /crawl              — start a crawl job")
 	log.Printf("[INFO]    GET  /crawl/status/:id   — check job status")
 	log.Printf("[INFO]    GET  /crawl/jobs          — list all jobs")
-	log.Printf("[INFO]    GET  /search?q=...&k=10   — BM25 ranked search")
 	log.Printf("[INFO]    GET  /search/stats        — query latency & QPS")
 	log.Printf("[INFO]    POST /eval               — precision@K & recall")
-	log.Printf("[INFO]    GET  /index/stats         — index statistics")
-	log.Printf("[INFO]    GET  /health              — health check")
-
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("[ERROR] Server failed: %v", err)
-	}
 }

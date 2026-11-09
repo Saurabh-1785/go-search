@@ -32,6 +32,18 @@ IMAGE_TAG="latest"
 DOCKER_USER="${DOCKER_USER:?Please set DOCKER_USER to your Docker Hub username}"
 FULL_IMAGE="${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
 
+# Admin API key for /crawl, /eval, /crawl/jobs, /search/stats.
+# Pass ADMIN_API_KEY to keep an existing key; otherwise a new one is generated.
+# It is stored as a Container Apps secret, not as a plain env var.
+ADMIN_API_KEY="${ADMIN_API_KEY:-$(openssl rand -hex 32)}"
+if [ "${#ADMIN_API_KEY}" -lt 16 ]; then
+  echo "ADMIN_API_KEY must be at least 16 characters" >&2
+  exit 1
+fi
+
+# Build from the project root no matter where the script is run from.
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # ── STEP 1: Resource Group ────────────────────────────────────────────────────
 echo ""
 echo "▶ [1/8] Creating resource group: ${RESOURCE_GROUP} (${LOCATION})"
@@ -84,7 +96,7 @@ echo "▶ [4/8] Building Docker image: ${FULL_IMAGE}"
 docker build \
   --platform linux/amd64 \
   -t "${FULL_IMAGE}" \
-  .   # run from project root — Dockerfile is in the project root
+  "${PROJECT_ROOT}"
 
 echo ""
 echo "▶ [5/8] Pushing image to Docker Hub..."
@@ -128,6 +140,10 @@ az containerapp env storage set \
 # 'az containerapp create' has no --volume flags, and its --yaml flag has a
 # known parsing bug (400 "System.Boolean" error). We bypass it entirely and
 # call the ARM REST API directly with az rest, which accepts JSON natively.
+#
+# maxReplicas is 1 on purpose: the index, rate limiter and job list live in
+# process memory, and only one process may write the index on the file share.
+# Several replicas would each serve a different index and race on saves.
 echo ""
 echo "▶ [8/8] Deploying Container App: ${CONTAINER_APP_NAME}"
 
@@ -143,7 +159,10 @@ echo "       Subscription : ${SUBSCRIPTION_ID}"
 echo "       Environment  : ${ENV_ID}"
 
 # Write the request body as JSON (native API format, no YAML parsing).
+# The file holds the admin key: mktemp creates it mode 0600, and the trap
+# deletes it even if a later step fails.
 JSON_FILE="$(mktemp /tmp/go-search-app-XXXXXX.json)"
+trap 'rm -f "${JSON_FILE}"' EXIT
 cat > "${JSON_FILE}" << JSON
 {
   "location": "${LOCATION}",
@@ -153,13 +172,17 @@ cat > "${JSON_FILE}" << JSON
       "ingress": {
         "external": true,
         "targetPort": 8080,
-        "transport": "auto"
-      }
+        "transport": "auto",
+        "allowInsecure": false
+      },
+      "secrets": [
+        { "name": "admin-api-key", "value": "${ADMIN_API_KEY}" }
+      ]
     },
     "template": {
       "scale": {
         "minReplicas": 0,
-        "maxReplicas": 3
+        "maxReplicas": 1
       },
       "volumes": [
         {
@@ -177,8 +200,10 @@ cat > "${JSON_FILE}" << JSON
             "memory": "1Gi"
           },
           "env": [
-            { "name": "DATA_DIR", "value": "/mnt/data" },
-            { "name": "PORT",     "value": "8080" }
+            { "name": "DATA_DIR",            "value": "/mnt/data" },
+            { "name": "PORT",                "value": "8080" },
+            { "name": "TRUST_PROXY_HEADERS", "value": "true" },
+            { "name": "ADMIN_API_KEY",       "secretRef": "admin-api-key" }
           ],
           "volumeMounts": [
             {
@@ -198,7 +223,8 @@ az rest \
   --method PUT \
   --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}?api-version=2024-03-01" \
   --headers "Content-Type=application/json" \
-  --body @"${JSON_FILE}"
+  --body @"${JSON_FILE}" \
+  --output none
 
 rm -f "${JSON_FILE}"
 
@@ -227,6 +253,10 @@ echo ""
 echo "  Storage account : ${STORAGE_ACCOUNT}"
 echo "  File share      : ${SHARE_NAME}"
 echo "  Mount path      : /mnt/data  (DATA_DIR inside container)"
+echo ""
+echo "  Admin API key (store it now — it is not shown again):"
+echo "    ${ADMIN_API_KEY}"
+echo "  Use it as:  curl -H 'Authorization: Bearer <key>' https://${APP_URL}/crawl/jobs"
 echo ""
 echo "  Crawl data lives at:"
 echo "    Azure Portal → Storage Accounts → ${STORAGE_ACCOUNT}"

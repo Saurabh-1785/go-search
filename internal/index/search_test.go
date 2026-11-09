@@ -437,8 +437,8 @@ func TestContentDiskStorage(t *testing.T) {
 	}
 
 	// After save: buffer should be cleared, content readable from disk.
-	if idx.contentsBuf != nil {
-		t.Error("contentsBuf should be nil after save")
+	if len(idx.pending) != 0 {
+		t.Errorf("pending should be empty after save, has %d entries", len(idx.pending))
 	}
 
 	// Content should still be readable (now from disk).
@@ -449,8 +449,12 @@ func TestContentDiskStorage(t *testing.T) {
 		t.Errorf("post-save content mismatch for doc 1: got %q, want %q", got, content1)
 	}
 
-	// Verify contents.bin exists.
-	contentsPath := filepath.Join(dir, "contents.bin")
+	// Verify contents.bin exists in the active generation.
+	genDir, err := resolveIndexDir(dir)
+	if err != nil {
+		t.Fatalf("resolveIndexDir: %v", err)
+	}
+	contentsPath := filepath.Join(genDir, "contents.bin")
 	info, err := os.Stat(contentsPath)
 	if err != nil {
 		t.Fatalf("contents.bin not found: %v", err)
@@ -652,9 +656,9 @@ func TestEvaluateNoRelevantFound(t *testing.T) {
 func TestQueryLogRecordAndStats(t *testing.T) {
 	ql := NewQueryLog()
 
-	ql.Record("golang", 2*time.Millisecond, 5)
-	ql.Record("rust", 3*time.Millisecond, 3)
-	ql.Record("python", 1*time.Millisecond, 8)
+	ql.Record(2*time.Millisecond, 5)
+	ql.Record(3*time.Millisecond, 3)
+	ql.Record(1*time.Millisecond, 8)
 
 	stats := ql.Stats()
 
@@ -700,7 +704,7 @@ func TestQueryLogRollingWindow(t *testing.T) {
 
 	// Record 110 queries — rolling window should keep last 100.
 	for i := 0; i < 110; i++ {
-		ql.Record("query", 1*time.Millisecond, 1)
+		ql.Record(1*time.Millisecond, 1)
 	}
 
 	stats := ql.Stats()

@@ -1,48 +1,33 @@
-package main
+package server
 
 import (
-	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
 
-	"search-engine/index"
+	"search-engine/internal/index"
+	"search-engine/internal/tokenizer"
 )
 
-// registerSearchRoutes sets up the search API endpoints on the given mux.
-func registerSearchRoutes(mux *http.ServeMux, idx *index.Index, ql *index.QueryLog) {
-	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-			return
-		}
-		handleSearch(w, r, idx, ql)
-	})
-
-	mux.HandleFunc("/search/stats", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-			return
-		}
-		writeJSON(w, http.StatusOK, ql.Stats())
-	})
-
-	mux.HandleFunc("/eval", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-			return
-		}
-		handleEval(w, r, idx)
-	})
-}
+// Search request limits. Each query term fans out to its own scoring
+// goroutine and k controls how many snippets are built (disk reads), so both
+// are bounded.
+const (
+	maxQueryBytes    = 512
+	maxQueryTerms    = 32
+	defaultTopK      = 10
+	maxTopK          = 100
+	maxEvalJudgments = 100
+)
 
 // handleSearch handles GET /search
 //
 // Query parameters:
 //
-//	q     — search query (required)
-//	k     — max results (default 10)
+//	q     — search query (required, max 512 bytes / 32 terms)
+//	k     — max results (default 10, max 100)
 //	mode  — "or" (default) or "and"
 //
 // Response:
@@ -61,21 +46,21 @@ func registerSearchRoutes(mux *http.ServeMux, idx *index.Index, ql *index.QueryL
 //	  "total_hits": 15,
 //	  "time_taken_ms": 1.23
 //	}
-func handleSearch(w http.ResponseWriter, r *http.Request, idx *index.Index, ql *index.QueryLog) {
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
-	if q == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "query parameter 'q' is required",
-		})
+	if err := validateQuery(q); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Parse optional parameters.
-	topK := 10
+	topK := defaultTopK
 	if kStr := r.URL.Query().Get("k"); kStr != "" {
-		if k, err := strconv.Atoi(kStr); err == nil && k > 0 {
-			topK = k
+		k, err := strconv.Atoi(kStr)
+		if err != nil || k < 1 || k > maxTopK {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("k must be an integer between 1 and %d", maxTopK))
+			return
 		}
+		topK = k
 	}
 
 	mode := r.URL.Query().Get("mode")
@@ -83,23 +68,34 @@ func handleSearch(w http.ResponseWriter, r *http.Request, idx *index.Index, ql *
 		mode = "or"
 	}
 	if mode != "or" && mode != "and" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "mode must be 'or' or 'and'",
-		})
+		writeError(w, http.StatusBadRequest, "mode must be 'or' or 'and'")
 		return
 	}
 
-	// Run the search and record in query log.
 	searchStart := time.Now()
-	response := idx.Search(q, topK, mode)
+	response := s.idx.Search(q, topK, mode)
 	latency := time.Since(searchStart)
 
-	ql.Record(q, latency, len(response.Results))
+	s.ql.Record(latency, len(response.Results))
 
-	log.Printf("[SEARCH] %q → %d hits, top %d returned (%.2fms)",
-		q, response.TotalHits, len(response.Results), response.TimeTakenMs)
+	// The query text is not logged: it can contain personal data.
+	log.Printf("[SEARCH] %d hits, top %d returned (%.2fms, cache_hit=%t)",
+		response.TotalHits, len(response.Results), response.TimeTakenMs, response.CacheHit)
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+func validateQuery(q string) error {
+	if q == "" {
+		return fmt.Errorf("query parameter 'q' is required")
+	}
+	if len(q) > maxQueryBytes {
+		return fmt.Errorf("query is too long (max %d bytes)", maxQueryBytes)
+	}
+	if n := len(tokenizer.Tokenize(q)); n > maxQueryTerms {
+		return fmt.Errorf("query has too many terms (%d, max %d)", n, maxQueryTerms)
+	}
+	return nil
 }
 
 // evalRequest is the JSON body for POST /eval.
@@ -116,35 +112,46 @@ func handleSearch(w http.ResponseWriter, r *http.Request, idx *index.Index, ql *
 //	  ]
 //	}
 type evalRequest struct {
-	K          int                       `json:"k"`
-	Judgments  []index.RelevanceJudgment  `json:"judgments"`
+	K         int                       `json:"k"`
+	Judgments []index.RelevanceJudgment `json:"judgments"`
 }
 
-// handleEval handles POST /eval
+// handleSearchStats handles GET /search/stats (admin only).
+func (s *Server) handleSearchStats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.ql.Stats())
+}
+
+// handleEval handles POST /eval (admin only).
 //
 // Runs evaluation against labeled relevance judgments and returns
 // precision@K and recall for each query, plus mean aggregates.
-func handleEval(w http.ResponseWriter, r *http.Request, idx *index.Index) {
+func (s *Server) handleEval(w http.ResponseWriter, r *http.Request) {
 	var req evalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "invalid JSON: " + err.Error(),
-		})
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if len(req.Judgments) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "judgments array is required and must not be empty",
-		})
+	if len(req.Judgments) == 0 || len(req.Judgments) > maxEvalJudgments {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("judgments must contain between 1 and %d entries", maxEvalJudgments))
+		return
+	}
+	for i, j := range req.Judgments {
+		if err := validateQuery(j.Query); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("judgments[%d]: %v", i, err))
+			return
+		}
+	}
+
+	if req.K == 0 {
+		req.K = defaultTopK
+	}
+	if req.K < 1 || req.K > maxTopK {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("k must be between 1 and %d", maxTopK))
 		return
 	}
 
-	if req.K <= 0 {
-		req.K = 10
-	}
-
-	report := index.Evaluate(idx, req.Judgments, req.K)
+	report := index.Evaluate(s.idx, req.Judgments, req.K)
 
 	log.Printf("[EVAL] %d queries, mean precision@%d=%.3f, mean recall=%.3f",
 		report.QueriesRun, req.K, report.MeanPrecision, report.MeanRecall)

@@ -19,8 +19,11 @@ type QueryLog struct {
 }
 
 // QueryRecord is a single logged query event.
+//
+// It deliberately holds no query text: search queries can contain personal
+// data (names, emails, health terms), and the stats endpoint only needs
+// performance numbers.
 type QueryRecord struct {
-	Query   string        `json:"query"`
 	Latency time.Duration `json:"latency_ns"` // in nanoseconds
 	Results int           `json:"results"`
 	Time    time.Time     `json:"time"`
@@ -28,11 +31,11 @@ type QueryRecord struct {
 
 // QueryLogStats is the JSON-serializable stats output.
 type QueryLogStats struct {
-	TotalQueries  int64          `json:"total_queries"`
-	AvgLatencyMs  float64        `json:"avg_latency_ms"`
-	QPS           float64        `json:"qps"`
-	UptimeSeconds float64        `json:"uptime_seconds"`
-	Recent        []QueryRecord  `json:"recent"` // last N queries for debugging
+	TotalQueries  int64         `json:"total_queries"`
+	AvgLatencyMs  float64       `json:"avg_latency_ms"`
+	QPS           float64       `json:"qps"`
+	UptimeSeconds float64       `json:"uptime_seconds"`
+	Recent        []QueryRecord `json:"recent"` // last N queries for debugging
 }
 
 // NewQueryLog creates a new QueryLog with the start time set to now.
@@ -46,7 +49,7 @@ func NewQueryLog() *QueryLog {
 // Record logs a single query event.
 //
 // Thread-safe — called from HTTP handlers that may serve concurrent requests.
-func (ql *QueryLog) Record(query string, latency time.Duration, resultCount int) {
+func (ql *QueryLog) Record(latency time.Duration, resultCount int) {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 
@@ -54,7 +57,6 @@ func (ql *QueryLog) Record(query string, latency time.Duration, resultCount int)
 	ql.totalLatency += latency
 
 	record := QueryRecord{
-		Query:   query,
 		Latency: latency,
 		Results: resultCount,
 		Time:    time.Now(),

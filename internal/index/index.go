@@ -1,7 +1,7 @@
 package index
 
 import (
-	"search-engine/tokenizer"
+	"search-engine/internal/tokenizer"
 	"sync"
 )
 
@@ -48,28 +48,31 @@ type IndexStats struct {
 //
 // Dictionary maps each stemmed token to its TermEntry (posting list + DF).
 // DocTable maps uint32 DocIDs back to document metadata.
-// ContentsBuf temporarily holds raw content during indexing — flushed to
-// contents.bin on SaveIndex, then cleared to free memory.
+// Pending holds raw content for documents that have not been written to
+// contents.bin yet, keyed by DocID. SaveIndex flushes it to disk and drops
+// the flushed entries to free memory.
 //
 // All methods are thread-safe — multiple goroutines can call AddDocument
 // concurrently (e.g., from crawler workers via the document channel).
 type Index struct {
-	mu          sync.RWMutex
-	dictionary  map[string]*TermEntry
-	docTable    []DocMeta
-	contentsBuf []string       // temporary buffer, flushed to disk on SaveIndex
-	nextDocID   uint32
-	contentDir  string         // directory where contents.bin lives (set after save/load)
-	cache       *SearchCache   // LRU cache for scored results (invalidated on AddDocument)
+	mu         sync.RWMutex
+	saveMu     sync.Mutex // serializes SaveIndex calls
+	dictionary map[string]*TermEntry
+	docTable   []DocMeta
+	pending    map[uint32]string // content not yet on disk, keyed by DocID
+	nextDocID  uint32
+	savedDocs  int          // number of docs (prefix of docTable) persisted to disk
+	contentDir string       // generation directory holding contents.bin (set after save/load)
+	cache      *SearchCache // LRU cache for scored results (invalidated on AddDocument)
 }
 
 // NewIndex creates an empty Index ready for document insertion.
 func NewIndex() *Index {
 	return &Index{
-		dictionary:  make(map[string]*TermEntry),
-		docTable:    make([]DocMeta, 0),
-		contentsBuf: make([]string, 0),
-		cache:       NewSearchCache(128),
+		dictionary: make(map[string]*TermEntry),
+		docTable:   make([]DocMeta, 0),
+		pending:    make(map[uint32]string),
+		cache:      NewSearchCache(128),
 	}
 }
 
@@ -116,7 +119,7 @@ func (idx *Index) AddDocument(externalID, url, title, content string) {
 	})
 
 	// Buffer raw content for later flush to disk.
-	idx.contentsBuf = append(idx.contentsBuf, content)
+	idx.pending[docID] = content
 
 	// Append postings for each unique term
 	for term, freq := range termFreqs {
@@ -236,8 +239,15 @@ func (idx *Index) Stats() IndexStats {
 	}
 }
 
-// GetDocContent reads a document's raw content from the content buffer
-// (during build) or from contents.bin on disk (after save).
+// Dirty reports whether the index holds documents that are not on disk yet.
+func (idx *Index) Dirty() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.docTable) > idx.savedDocs
+}
+
+// GetDocContent reads a document's raw content from the pending buffer
+// (not yet saved) or from contents.bin on disk (after save).
 // Returns empty string if content is not available.
 func (idx *Index) GetDocContent(docID uint32) string {
 	idx.mu.RLock()
@@ -247,9 +257,9 @@ func (idx *Index) GetDocContent(docID uint32) string {
 		return ""
 	}
 
-	// If content buffer still has data (pre-save), use it.
-	if idx.contentsBuf != nil && int(docID) < len(idx.contentsBuf) {
-		return idx.contentsBuf[docID]
+	// Content not flushed to disk yet.
+	if content, ok := idx.pending[docID]; ok {
+		return content
 	}
 
 	// Otherwise, read from disk.
@@ -258,7 +268,7 @@ func (idx *Index) GetDocContent(docID uint32) string {
 		return ""
 	}
 
-	content, err := ReadDocContent(idx.contentDir, meta.ContentOffset, meta.ContentLength)
+	content, err := readDocContent(idx.contentDir, meta.ContentOffset, meta.ContentLength)
 	if err != nil {
 		return ""
 	}
